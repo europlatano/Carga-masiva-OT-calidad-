@@ -12,10 +12,10 @@ import streamlit as st
 
 API = 'https://app.fracttal.com/api'
 TOKEN_URL = 'https://one.fracttal.com/oauth/token'
-APP_VER = '1.6'
+APP_VER = '1.7'
 st.set_page_config(page_title='Calidad → Fracttal | Europlátano', page_icon='📋', layout='wide')
 st.title('📋 Auditorías de Calidad → Solicitudes Fracttal')
-st.caption(f'Europlátano · V{APP_VER} · Diagnóstico HTTP · IFS / GLOBALG.A.P. · No crea órdenes de trabajo')
+st.caption(f'Europlátano · V{APP_VER} · Diagnóstico ampliado HTTP · IFS / GLOBALG.A.P. · No crea órdenes de trabajo')
 
 def sec(k):
     try: return str(st.secrets.get(k,'')).strip()
@@ -84,38 +84,49 @@ def oauth():
     if not token:raise RuntimeError('Fracttal no devolvió token OAuth.')
     return token
 
-def _safe_api_error(body):
-    """Muestra detalles de validación sin volcar tokens ni cuerpos de solicitudes."""
-    if not isinstance(body,dict):
-        return 'Fracttal no devolvió un error JSON interpretable.'
-    parts=[]
-    for key in ('message','error','error_description','detail','errors'):
-        value=body.get(key)
-        if not value: continue
-        if isinstance(value,dict):
-            for field,reason in list(value.items())[:12]:
-                parts.append(f'{field}: {reason}')
-        elif isinstance(value,list):
-            for entry in value[:12]:
-                if isinstance(entry,dict):
-                    parts.append(f"{entry.get('field',entry.get('property','campo'))}: {entry.get('message',entry.get('error','validación incorrecta'))}")
-                else: parts.append(str(entry))
-        else: parts.append(str(value))
-    msg=' | '.join(parts) if parts else 'Sin detalle de validación en la respuesta.'
-    # No mostrar accidentalmente credenciales ni datos completos de la solicitud.
+def _redact_error(value):
+    """Redacta credenciales y evita mostrar datos extensos del servidor."""
+    msg=str(value)
     for secret in (CID,CSECRET):
         if secret: msg=msg.replace(secret,'[OCULTO]')
     msg=re.sub(r'(?i)(bearer\s+)[A-Za-z0-9._-]+',r'\1[OCULTO]',msg)
-    return msg[:1200]
+    msg=re.sub(r'(?i)(access_token|refresh_token|client_secret|authorization)([\"\' ]*[:=][\"\' ]*)([^,}\s]+)',r'\1\2[OCULTO]',msg)
+    return msg[:1600]
+
+def _safe_api_error(body, raw_text='', content_type=''):
+    """Extrae el rechazo del API, también si no utiliza las claves habituales."""
+    if isinstance(body,dict):
+        parts=[]
+        for key in ('message','error','error_description','detail','errors','data','status','code'):
+            value=body.get(key)
+            if value is not None and value != '' and value != [] and value != {}:
+                parts.append(f'{key}: {value}')
+        if not parts:
+            parts=[f'Campos de respuesta: {list(body.keys())[:15]} (sin descripción del error)']
+        return _redact_error(' | '.join(parts))
+    if isinstance(body,list):
+        return _redact_error(body[:5])
+    if raw_text and len(raw_text.strip()) > 0:
+        # No reproducir páginas HTML completas, que pueden contener datos internos.
+        if 'html' in content_type.lower() or raw_text.lstrip().lower().startswith('<!doctype'):
+            return 'Fracttal devolvió HTML, no un mensaje JSON de validación.'
+        return _redact_error(raw_text[:500])
+    return 'Fracttal devolvió una respuesta vacía sin detalle de validación.'
 
 def request(method,endpoint,token,*,payload=None,params=None):
     headers={'Authorization':'Bearer '+token,'Accept':'application/json'}
     if payload is not None: headers['Content-Type']='application/json'
-    res=requests.request(method,API+endpoint,headers=headers,json=payload,params=params,timeout=40)
+    try:
+        res=requests.request(method,API+endpoint,headers=headers,json=payload,params=params,timeout=40)
+    except requests.RequestException as exc:
+        raise RuntimeError(f'{method} {endpoint}: error de conexión ({type(exc).__name__}). No se puede confirmar si se procesó la solicitud.') from None
     try: body=res.json()
-    except ValueError: body={}
+    except ValueError: body=None
     if res.status_code>=400 or (isinstance(body,dict) and body.get('success') is False):
-        raise RuntimeError(f'{method} {endpoint}: HTTP {res.status_code}. {_safe_api_error(body)}')
+        detail=_safe_api_error(body,res.text,res.headers.get('Content-Type',''))
+        # Únicamente claves del payload, nunca valores ni tokens.
+        keys=', '.join(sorted(payload.keys())) if isinstance(payload,dict) else '(sin payload)'
+        raise RuntimeError(f'{method} {endpoint}: HTTP {res.status_code} | Respuesta: {detail} | Campos enviados: {keys}')
     return body
 
 def fetch_all(token):
@@ -376,7 +387,7 @@ requested_by=st.text_input('Solicitante (obligatorio)',value='Departamento de Ca
 urgency=st.selectbox('Urgencia por defecto', ['No urgente (recomendado)','Urgente (solo si procede)'])
 st.caption('Cada solicitud se asociará al activo provisional de la planta. El grupo y las clasificaciones deben coincidir con los catálogos existentes en Fracttal.')
 group=st.selectbox('Grupo Fracttal', ['Calidad / Ajuste / Especificación','Incidencia (sin paro)','Mejora / Solicitud (no avería)','Seguridad / Riesgo / Medioambiente','Avería (con paro)'],index=0)
-cat1_options=['Infraestructura y edificio','Aire comprimido y neumática','Automatización y control (PLC, HMI, variadores, sensores','Electricidad potencia (cuadros, protecciones, motores)','Envasado / embolsado / sellado','Etiquetado / impresión','Frío industrial (cámaras/túnel)','Hidráulica / bombeo / fluidos','Lavado / agua de proceso / drenajes','Paletizado / flejado','Pesaje / control / detección','Transportadores y movimiento','Vehículos de transporte (carretera / recogida)','Vehículos industriales (carretillas, transpaletas, etc.)']
+cat1_options=['Infraestructura y edificio','Aire comprimido y neumática','Automatización y control (PLC, HMI, variadores, sensores)','Electricidad potencia (cuadros, protecciones, motores)','Envasado / embolsado / sellado','Etiquetado / impresión','Frío industrial (cámaras/túnel)','Hidráulica / bombeo / fluidos','Lavado / agua de proceso / drenajes','Paletizado / flejado','Pesaje / control / detección','Transportadores y movimiento','Vehículos de transporte (carretera / recogida)','Vehículos industriales (carretillas, transpaletas, etc.)']
 cat2_options=['Otros / no sé','Alarma / error','Atasco / bloqueo','Está roto','Falta elemento/ inexistente','Falta nivel / falta presión / falta suministro','Funciona pero mal','Hace ruido anormal','Huele mal / quemado / humo','No funciona / no arranca','Pierde líquido / fuga','Roto / partido','Se calienta','Se para / falla a ratos','Suelto / desajustado','Vibra']
 category1=st.selectbox('Clasificación 1 (catálogo de Fracttal)',cat1_options)
 category2=st.selectbox('Clasificación 2 (catálogo de Fracttal)',cat2_options)
@@ -460,5 +471,5 @@ if st.button('🚀 Crear solicitudes seleccionadas',type='primary',disabled=not 
             st.session_state.pop('audit_check',None)
     except Exception as e:st.error(str(e))
 
-st.caption('Versión 1.6 · Diagnóstico de errores HTTP: muestra los campos rechazados por Fracttal cuando la API facilita detalles. No muestra contraseñas ni tokens.')
+st.caption('Versión 1.7 · Diagnóstico ampliado: respuesta de Fracttal y nombres de los campos enviados, sin credenciales ni valores del hallazgo.')
 st.caption('Las fotografías solo se transfieren al confirmar la creación. Si falla un adjunto, la solicitud ya creada NO se repite. Fuente: Excel del Departamento de Calidad. API oficial: https://api.fracttal.com/es/reference/crear-una-nueva-solicitud')
