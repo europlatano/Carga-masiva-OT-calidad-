@@ -258,9 +258,27 @@ mode=st.radio('Vista',choices,index=0,horizontal=False)
 if mode==choices[0]:view=df[df.seleccion].copy()
 elif mode==choices[1]:view=df[df.estado.map(norm).isin(('abierta','abierto','pendiente'))].copy()
 else:view=df.copy()
-# Se puede desmarcar individualmente. Las filas no seleccionadas por defecto se muestran desmarcadas.
+# Selección masiva: restablece el editor al cambiar de vista o al pulsar los botones.
+# La clave de revisión evita que Streamlit conserve marcas antiguas del data_editor.
+selection_scope=f'{hashlib.sha256(blob).hexdigest()[:16]}_{choices.index(mode)}'
+if st.session_state.get('quality_selection_scope')!=selection_scope:
+    st.session_state['quality_selection_scope']=selection_scope
+    st.session_state['quality_selection_revision']=0
+    st.session_state['quality_selection_override']=None
+left,right=st.columns(2)
+with left:
+    mark_all=st.button('☑️ Marcar todas las visibles',use_container_width=True,key='quality_mark_all')
+with right:
+    unmark_all=st.button('⬜ Desmarcar todas las visibles',use_container_width=True,key='quality_unmark_all')
+if mark_all or unmark_all:
+    st.session_state['quality_selection_override']=bool(mark_all)
+    st.session_state['quality_selection_revision']+=1
+if st.session_state['quality_selection_override'] is not None:
+    view['seleccion']=st.session_state['quality_selection_override']
+st.caption('Estos botones afectan solo a la vista actual. Después puedes marcar o desmarcar incidencias individualmente.')
 cols=['seleccion','fila_excel','fecha','zona','incidencia','responsable','estado','referencia']
-edited=st.data_editor(view[cols],hide_index=True,use_container_width=True,num_rows='fixed',key='quality_editor_'+str(choices.index(mode)),disabled=[c for c in cols if c!='seleccion'],column_config={'seleccion':st.column_config.CheckboxColumn('Importar'), 'incidencia':st.column_config.TextColumn('Hallazgo',width='large'),'zona':st.column_config.TextColumn('Zona',width='medium')})
+editor_key=f"quality_editor_{selection_scope}_{st.session_state['quality_selection_revision']}"
+edited=st.data_editor(view[cols],hide_index=True,use_container_width=True,num_rows='fixed',key=editor_key,disabled=[c for c in cols if c!='seleccion'],column_config={'seleccion':st.column_config.CheckboxColumn('Importar'), 'incidencia':st.column_config.TextColumn('Hallazgo',width='large'),'zona':st.column_config.TextColumn('Zona',width='medium')})
 selected_refs=set(edited.loc[edited['seleccion']==True,'referencia'].tolist())
 selected=df[df.referencia.isin(selected_refs)].copy()
 st.caption(f'Seleccionadas para revisión: {len(selected)}. Cada hallazgo conservará una referencia estable para evitar duplicados.')
