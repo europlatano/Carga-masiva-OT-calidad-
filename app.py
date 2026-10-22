@@ -12,10 +12,10 @@ import streamlit as st
 
 API = 'https://app.fracttal.com/api'
 TOKEN_URL = 'https://one.fracttal.com/oauth/token'
-APP_VER = '1.2'
+APP_VER = '1.5'
 st.set_page_config(page_title='Calidad → Fracttal | Europlátano', page_icon='📋', layout='wide')
 st.title('📋 Auditorías de Calidad → Solicitudes Fracttal')
-st.caption('Europlátano · V1.2 · IFS / GLOBALG.A.P. · No crea órdenes de trabajo')
+st.caption('Europlátano · V1.5 · IFS / GLOBALG.A.P. · No crea órdenes de trabajo')
 
 def sec(k):
     try: return str(st.secrets.get(k,'')).strip()
@@ -52,12 +52,12 @@ def clean(v):
     if v is None or pd.isna(v): return ''
     return str(v).strip()
 
-def ident(date_val, area, incidence, occurrence):
+def ident(date_val, area, incidence, occurrence, plant_code):
     # Referencia estable entre exportaciones aun si cambian el orden de filas.
     seed='|'.join((dtstr(date_val),norm(area),norm(incidence),str(occurrence)))
-    return 'CAL-IFS-PAL-'+hashlib.sha256(seed.encode('utf-8')).hexdigest()[:16].upper()
+    return 'CAL-IFS-'+plant_code+'-'+hashlib.sha256(seed.encode('utf-8')).hexdigest()[:16].upper()
 
-def extract(blob):
+def extract(blob, plant_code):
     frame=pd.read_excel(io.BytesIO(blob),sheet_name=0,header=1,engine='openpyxl',dtype=object)
     if frame.shape[1]<10: raise ValueError('El Excel no contiene las diez columnas esperadas de Calidad.')
     result=[]; occurred=Counter()
@@ -66,7 +66,7 @@ def extract(blob):
         incident=clean(row[3]); area=clean(row[2]); status=clean(row[9]); dept=clean(row[6]); day=dtstr(row[1])
         if not incident or not day: continue
         signature=(day,norm(area),norm(incident));occurred[signature]+=1
-        ref=ident(row[1],area,incident,occurred[signature])
+        ref=ident(row[1],area,incident,occurred[signature],plant_code)
         maintenance='mantenimiento' in norm(dept)
         opened=norm(status) in ('abierta','abierto','pendiente')
         result.append(dict(fila_excel=int(ix)+3,referencia=ref,fecha=day,zona=area,
@@ -150,21 +150,23 @@ def fetch_all(token):
         if identifier:
             refs.add(identifier)
         observation = str(item.get('observation') or '')
-        refs.update(re.findall(r'CAL-IFS-PAL-[0-9A-F]{16}', observation, re.IGNORECASE))
+        refs.update(re.findall(r'CAL-IFS-[A-Z]{3}-[0-9A-F]{16}', observation, re.IGNORECASE))
     return refs, len(found)
 
 def title(row):
     text=re.sub(r'\s+',' ',str(row['incidencia'])).strip()
     return ('AUDITORÍA IFS · '+text)[:200]
 
-def body_of(row,user_code,requested_by,urgent):
-    parts=[f"Origen: inspección interna IFS · Palomares",f"Referencia: {row['referencia']}",f"Fecha de detección: {row['fecha']}",f"Zona/área: {row['zona']}",f"Hallazgo de Calidad: {row['incidencia']}"]
+def body_of(row,user_code,requested_by,urgent,plant_name,asset_code,group,category1,category2):
+    parts=[f"Origen: inspección interna IFS · {plant_name}",f"Referencia: {row['referencia']}",f"Fecha de detección: {row['fecha']}",f"Zona/área: {row['zona']}",f"Hallazgo de Calidad: {row['incidencia']}"]
     for label,col in [('Acción correctiva indicada por Calidad','accion_calidad'),('Evidencia','evidencia'),('Responsable en Excel','responsable'),('Fecha objetivo de cierre','fecha_prevista'),('Observaciones','observaciones')]:
         val=str(row.get(col,'')).strip()
         if val: parts.append(f'{label}: {val}')
     return {'user_code':user_code,'user_type':'HUMAN_RESOURCES','description':title(row),
       'observation':'\n'.join(parts),'date_incident':row['fecha']+'T12:00:00-00',
-      'requested_by':requested_by[:200], 'identifier':row['referencia'],'is_urgent':bool(urgent)}
+      'requested_by':requested_by[:200], 'identifier':row['referencia'],'is_urgent':bool(urgent),
+      'code':asset_code,'types_description':group,'types_1_description':category1,
+      'types_2_description':category2}
 
 MAX_ZIP_BYTES=180*1024*1024
 MAX_IMAGE_BYTES=20*1024*1024
@@ -231,15 +233,29 @@ def attach_photos(token, request_id, assigned, images):
 def response_id(response):
     data=response.get('data') if isinstance(response,dict) else None
     if isinstance(data,list) and len(data)==1: data=data[0]
-    if isinstance(data,dict) and data.get('id_code') is not None:
-        return int(data['id_code'])
+    if isinstance(data,dict):
+        value=data.get('id_code',data.get('id'))
+        if value is not None: return int(value)
     return None
 
+PLANTS = {
+    'Palomares': ('PAL','GEN-CAL-PAL'),
+    'Puntallana': ('PUN','GEN-CAL-PUN'),
+    'Tenerife Sur': ('TFS','GEN-CAL-TFS'),
+    'Tenerife Norte': ('TFN','GEN-CAL-TFN'),
+    'La Caleta': ('LCL','GEN-CAL-LCL'),
+    'Puerto de la Cruz': ('PTC','GEN-CAL-PTC'),
+    'El Hierro': ('HIE','GEN-CAL-HIE'),
+}
+st.subheader('0 · Centro de trabajo')
+plant_name=st.selectbox('Planta a la que corresponden las incidencias',list(PLANTS),key='quality_plant')
+plant_code,asset_code=PLANTS[plant_name]
+st.info(f'Activo provisional de Fracttal: {asset_code} · Centro: {plant_name}')
 upload=st.file_uploader('1 · Selecciona el Excel original del Departamento de Calidad',type=['xlsx'])
 if upload is None:
-    st.info('Sube el Excel de Inspecciones internas IFS de Palomares. Por defecto se seleccionarán únicamente las incidencias ABIERTAS asignadas a Mantenimiento, incluidas las compartidas.');st.stop()
+    st.info('Sube el Excel de Inspecciones internas IFS de la planta seleccionada. Por defecto se seleccionarán únicamente las incidencias ABIERTAS asignadas a Mantenimiento, incluidas las compartidas.');st.stop()
 blob=upload.getvalue()
-try: df=extract(blob)
+try: df=extract(blob,plant_code)
 except Exception as exc: st.error(f'No se pudo interpretar el Excel: {exc}');st.stop()
 if df.empty:st.warning('No se encontraron registros válidos.');st.stop()
 sc=norm('abierta')
@@ -337,11 +353,17 @@ def_user=sec('FRACTTAL_REQUEST_USER_CODE')
 user_code=st.text_input('Código del usuario/recurso humano que registrará la solicitud (obligatorio)',value=def_user,help='Es user_code, NO el nombre ni el email. Lo puedes guardar en Secrets como FRACTTAL_REQUEST_USER_CODE.')
 requested_by=st.text_input('Solicitante (obligatorio)',value='Departamento de Calidad – Europlátano')
 urgency=st.selectbox('Urgencia por defecto', ['No urgente (recomendado)','Urgente (solo si procede)'])
-st.caption('La zona y la referencia del hallazgo se incluyen en la descripción. No se asocia un activo si no se conoce su código exacto. La prioridad de Fracttal se gestiona mediante is_urgent.')
+st.caption('Cada solicitud se asociará al activo provisional de la planta. El grupo y las clasificaciones deben coincidir con los catálogos existentes en Fracttal.')
+group=st.selectbox('Grupo Fracttal', ['Calidad / Ajuste / Especificación','Incidencia (sin paro)','Mejora / Solicitud (no avería)','Seguridad / Riesgo / Medioambiente','Avería (con paro)'],index=0)
+cat1_options=['Infraestructura y edificio','Aire comprimido y neumática','Automatización y control (PLC, HMI, variadores, sensores','Electricidad potencia (cuadros, protecciones, motores)','Envasado / embolsado / sellado','Etiquetado / impresión','Frío industrial (cámaras/túnel)','Hidráulica / bombeo / fluidos','Lavado / agua de proceso / drenajes','Paletizado / flejado','Pesaje / control / detección','Transportadores y movimiento','Vehículos de transporte (carretera / recogida)','Vehículos industriales (carretillas, transpaletas, etc.)']
+cat2_options=['Otros / no sé','Alarma / error','Atasco / bloqueo','Está roto','Falta elemento/ inexistente','Falta nivel / falta presión / falta suministro','Funciona pero mal','Hace ruido anormal','Huele mal / quemado / humo','No funciona / no arranca','Pierde líquido / fuga','Roto / partido','Se calienta','Se para / falla a ratos','Suelto / desajustado','Vibra']
+category1=st.selectbox('Clasificación 1 (catálogo de Fracttal)',cat1_options)
+category2=st.selectbox('Clasificación 2 (catálogo de Fracttal)',cat2_options)
+st.warning('Revisa las clasificaciones antes de importar: estos valores se aplican a todas las incidencias seleccionadas. Para distintas clases, haz importaciones separadas.')
 if not user_code.strip() or not requested_by.strip(): st.warning('Completa el código de usuario y el solicitante para continuar.');st.stop()
 
 st.subheader('5 · Comprobar duplicados (solo lectura)')
-filetag=hashlib.sha256(blob).hexdigest()[:12]
+filetag=hashlib.sha256(blob+plant_code.encode()).hexdigest()[:12]
 if st.button('🔎 Consultar solicitudes existentes en Fracttal'):
     try:
         tk=oauth();refs,seen=fetch_all(tk)
@@ -386,7 +408,7 @@ if st.button('🚀 Crear solicitudes seleccionadas',type='primary',disabled=not 
                 results.append({'referencia':ref,'resultado':'Omitida: ya existe','detalle':''})
             else:
                 try:
-                    response=request('POST','/work_requests/',tk,payload=body_of(row,user_code.strip(),requested_by.strip(),urgency.startswith('Urgente')))
+                    response=request('POST','/work_requests/',tk,payload=body_of(row,user_code.strip(),requested_by.strip(),urgency.startswith('Urgente'),plant_name,asset_code,group,category1,category2))
                     confirmed_remote=bool(isinstance(response,dict) and response.get('success') is True and response.get('data'))
                     if not confirmed_remote:
                         results.append({'referencia':ref,'resultado':'Respuesta sin confirmación','detalle':'Comprobar en Fracttal'})
@@ -396,8 +418,8 @@ if st.button('🚀 Crear solicitudes seleccionadas',type='primary',disabled=not 
                     if photos:
                         req_id=response_id(response)
                         if req_id is None:
-                            results.append({'referencia':ref,'resultado':'Solicitud creada; fotos pendientes','detalle':'La respuesta no incluye id_code. Revisar en Fracttal antes de reintentar.'})
-                            st.error('Solicitud creada, pero falta id_code para adjuntar fotos. Se detiene el proceso.');break
+                            results.append({'referencia':ref,'resultado':'Solicitud creada; fotos pendientes','detalle':'La respuesta no incluye id/id_code. Revisar en Fracttal antes de reintentar.'})
+                            st.error('Solicitud creada, pero falta identificador para adjuntar fotos. Se detiene el proceso.');break
                         try:
                             n=attach_photos(tk,req_id,photos,images)
                             results.append({'referencia':ref,'resultado':f'Creada con {n} foto(s)','detalle':''})
