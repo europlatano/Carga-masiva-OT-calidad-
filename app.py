@@ -12,10 +12,10 @@ import streamlit as st
 
 API = 'https://app.fracttal.com/api'
 TOKEN_URL = 'https://one.fracttal.com/oauth/token'
-APP_VER = '1.5'
+APP_VER = '1.6'
 st.set_page_config(page_title='Calidad → Fracttal | Europlátano', page_icon='📋', layout='wide')
 st.title('📋 Auditorías de Calidad → Solicitudes Fracttal')
-st.caption('Europlátano · V1.5 · IFS / GLOBALG.A.P. · No crea órdenes de trabajo')
+st.caption(f'Europlátano · V{APP_VER} · Diagnóstico HTTP · IFS / GLOBALG.A.P. · No crea órdenes de trabajo')
 
 def sec(k):
     try: return str(st.secrets.get(k,'')).strip()
