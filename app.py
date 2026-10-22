@@ -84,6 +84,30 @@ def oauth():
     if not token:raise RuntimeError('Fracttal no devolvió token OAuth.')
     return token
 
+def _safe_api_error(body):
+    """Muestra detalles de validación sin volcar tokens ni cuerpos de solicitudes."""
+    if not isinstance(body,dict):
+        return 'Fracttal no devolvió un error JSON interpretable.'
+    parts=[]
+    for key in ('message','error','error_description','detail','errors'):
+        value=body.get(key)
+        if not value: continue
+        if isinstance(value,dict):
+            for field,reason in list(value.items())[:12]:
+                parts.append(f'{field}: {reason}')
+        elif isinstance(value,list):
+            for entry in value[:12]:
+                if isinstance(entry,dict):
+                    parts.append(f"{entry.get('field',entry.get('property','campo'))}: {entry.get('message',entry.get('error','validación incorrecta'))}")
+                else: parts.append(str(entry))
+        else: parts.append(str(value))
+    msg=' | '.join(parts) if parts else 'Sin detalle de validación en la respuesta.'
+    # No mostrar accidentalmente credenciales ni datos completos de la solicitud.
+    for secret in (CID,CSECRET):
+        if secret: msg=msg.replace(secret,'[OCULTO]')
+    msg=re.sub(r'(?i)(bearer\s+)[A-Za-z0-9._-]+',r'\1[OCULTO]',msg)
+    return msg[:1200]
+
 def request(method,endpoint,token,*,payload=None,params=None):
     headers={'Authorization':'Bearer '+token,'Accept':'application/json'}
     if payload is not None: headers['Content-Type']='application/json'
@@ -91,10 +115,7 @@ def request(method,endpoint,token,*,payload=None,params=None):
     try: body=res.json()
     except ValueError: body={}
     if res.status_code>=400 or (isinstance(body,dict) and body.get('success') is False):
-        msg=body.get('message') if isinstance(body,dict) else None
-        # No mostramos cuerpo crudo (potencialmente datos sensibles).
-        msg=str(msg)[:160] if isinstance(msg,str) and not any(x in msg.lower() for x in ('token','secret','password')) else 'Revisar permisos o datos obligatorios.'
-        raise RuntimeError(f'{method} {endpoint}: HTTP {res.status_code}. {msg}')
+        raise RuntimeError(f'{method} {endpoint}: HTTP {res.status_code}. {_safe_api_error(body)}')
     return body
 
 def fetch_all(token):
@@ -429,8 +450,8 @@ if st.button('🚀 Crear solicitudes seleccionadas',type='primary',disabled=not 
                     else:
                         results.append({'referencia':ref,'resultado':'Creada sin fotografías','detalle':''})
                 except Exception as e:
-                    results.append({'referencia':ref,'resultado':'Error / comprobar en Fracttal','detalle':str(e)[:180]})
-                    st.error('Se ha detenido la importación para evitar duplicados. Comprueba la solicitud antes de reintentar.');break
+                    results.append({'referencia':ref,'resultado':'Error / comprobar en Fracttal','detalle':str(e)[:1200]})
+                    st.error('Fracttal ha rechazado la petición o no se ha podido confirmar. Lee la columna detalle para conocer la validación y comprueba la solicitud antes de reintentar.');break
             bar.progress((i+1)/len(target))
         if results:
             out=pd.DataFrame(results)
@@ -439,4 +460,5 @@ if st.button('🚀 Crear solicitudes seleccionadas',type='primary',disabled=not 
             st.session_state.pop('audit_check',None)
     except Exception as e:st.error(str(e))
 
+st.caption('Versión 1.6 · Diagnóstico de errores HTTP: muestra los campos rechazados por Fracttal cuando la API facilita detalles. No muestra contraseñas ni tokens.')
 st.caption('Las fotografías solo se transfieren al confirmar la creación. Si falla un adjunto, la solicitud ya creada NO se repite. Fuente: Excel del Departamento de Calidad. API oficial: https://api.fracttal.com/es/reference/crear-una-nueva-solicitud')
