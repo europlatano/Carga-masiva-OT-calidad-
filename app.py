@@ -2,7 +2,7 @@
 Sin borrados, sin crear órdenes de trabajo. No conserva ficheros entre sesiones.
 """
 from __future__ import annotations
-import hashlib, hmac, io, re, unicodedata
+import hashlib, hmac, io, re, unicodedata, zipfile, os
 from collections import Counter
 from datetime import datetime, date, timezone
 from zoneinfo import ZoneInfo
@@ -12,10 +12,10 @@ import streamlit as st
 
 API = 'https://app.fracttal.com/api'
 TOKEN_URL = 'https://one.fracttal.com/oauth/token'
-APP_VER = '1.0'
+APP_VER = '1.2'
 st.set_page_config(page_title='Calidad → Fracttal | Europlátano', page_icon='📋', layout='wide')
 st.title('📋 Auditorías de Calidad → Solicitudes Fracttal')
-st.caption('Europlátano · V1 · IFS / GLOBALG.A.P. · No crea órdenes de trabajo')
+st.caption('Europlátano · V1.2 · IFS / GLOBALG.A.P. · No crea órdenes de trabajo')
 
 def sec(k):
     try: return str(st.secrets.get(k,'')).strip()
@@ -98,20 +98,60 @@ def request(method,endpoint,token,*,payload=None,params=None):
     return body
 
 def fetch_all(token):
-    # La documentación no garantiza una semántica de paginación idéntica en todas las cuentas.
-    # Si no es verificable, impedimos importar para evitar duplicados.
-    data=request('GET','/work_requests/',token,params={'since':'2023-01-01T00:00:00-00','until':datetime.now(timezone.utc).strftime('%Y-%m-%dT23:59:59-00')})
-    if not isinstance(data,dict) or not isinstance(data.get('data'),list):
-        raise RuntimeError('Fracttal no devolvió una lista verificable de solicitudes.')
-    found=data['data']; total=data.get('total')
-    if total not in (None,''):
+    """Recorre todas las páginas usando start/limit oficiales de Fracttal.
+
+    Ante inconsistencias, se interrumpe sin habilitar ninguna escritura.
+    """
+    page_size = 100
+    since = '2023-01-01T00:00:00-00'
+    until = datetime.now(timezone.utc).strftime('%Y-%m-%dT23:59:59-00')
+    found = []
+    seen_codes = set()
+    expected_total = None
+    for start in range(0, 100000, page_size):
+        params = {'since': since, 'until': until, 'start': start, 'limit': page_size}
+        data = request('GET', '/work_requests/', token, params=params)
+        if not isinstance(data, dict) or not isinstance(data.get('data'), list):
+            raise RuntimeError('Respuesta de Fracttal no verificable al consultar solicitudes.')
+        batch = data['data']
         try:
-            if int(total)>len(found):
-                raise RuntimeError('Fracttal devolvió una consulta parcial (%s de %s). No se permite importar hasta configurar paginación segura.'%(len(found),total))
-        except ValueError: pass
-    # Una cuenta puede tener más solicitudes antiguas fuera del intervalo; cada identificador de auditoría empieza con prefijo y se busca además por referencia.
-    refs={str(x.get('identifier') or '').strip() for x in found if isinstance(x,dict)}
-    return refs,len(found)
+            total = int(data['total'])
+        except (KeyError, ValueError, TypeError):
+            raise RuntimeError('Fracttal no informó el total de solicitudes. Importación bloqueada.')
+        if expected_total is None:
+            expected_total = total
+        elif total != expected_total:
+            raise RuntimeError('El total de solicitudes cambió durante la paginación. Vuelve a consultar.')
+        if len(batch) > page_size or start + len(batch) > expected_total:
+            raise RuntimeError('Fracttal devolvió un bloque de tamaño incoherente. Importación bloqueada.')
+        if not batch and len(found) < expected_total:
+            raise RuntimeError('La paginación terminó antes de recuperar todas las solicitudes.')
+        for item in batch:
+            if not isinstance(item, dict) or item.get('id_code') is None:
+                raise RuntimeError('Solicitud sin identificador único en la consulta. Importación bloqueada.')
+            code = str(item['id_code'])
+            if code in seen_codes:
+                raise RuntimeError('Fracttal repitió solicitudes entre páginas. Importación bloqueada.')
+            seen_codes.add(code)
+            found.append(item)
+        if len(found) == expected_total:
+            break
+        if len(batch) != page_size:
+            raise RuntimeError('Página incompleta antes de llegar al total. Importación bloqueada.')
+    else:
+        raise RuntimeError('Se superó el límite de seguridad de paginación.')
+    if len(found) != expected_total:
+        raise RuntimeError(f'Consulta incompleta: {len(found)} de {expected_total}. Importación bloqueada.')
+    # identifier es la referencia oficial. Como respaldo, se busca la referencia
+    # también en las observaciones de solicitudes anteriores.
+    refs = set()
+    for item in found:
+        identifier = str(item.get('identifier') or '').strip()
+        if identifier:
+            refs.add(identifier)
+        observation = str(item.get('observation') or '')
+        refs.update(re.findall(r'CAL-IFS-PAL-[0-9A-F]{16}', observation, re.IGNORECASE))
+    return refs, len(found)
 
 def title(row):
     text=re.sub(r'\s+',' ',str(row['incidencia'])).strip()
@@ -125,6 +165,75 @@ def body_of(row,user_code,requested_by,urgent):
     return {'user_code':user_code,'user_type':'HUMAN_RESOURCES','description':title(row),
       'observation':'\n'.join(parts),'date_incident':row['fecha']+'T12:00:00-00',
       'requested_by':requested_by[:200], 'identifier':row['referencia'],'is_urgent':bool(urgent)}
+
+MAX_ZIP_BYTES=180*1024*1024
+MAX_IMAGE_BYTES=20*1024*1024
+MAX_IMAGES=350
+PHOTO_EXT={'.jpg','.jpeg','.png','.gif','.bmp','.tif','.tiff'}
+
+def load_photos(blob):
+    if len(blob)>MAX_ZIP_BYTES: raise ValueError('ZIP demasiado grande (máximo 180 MB).')
+    images={}; total=0
+    with zipfile.ZipFile(io.BytesIO(blob)) as z:
+        for entry in z.infolist():
+            if entry.is_dir() or entry.filename.startswith('__MACOSX/') or os.path.basename(entry.filename).startswith('.'):
+                continue
+            name=entry.filename.replace('\\','/')
+            if name.startswith('/') or '..' in name.split('/') or entry.flag_bits & 1:
+                raise ValueError('ZIP con rutas no permitidas o archivos cifrados.')
+            if os.path.splitext(name)[1].lower() not in PHOTO_EXT: continue
+            if entry.file_size>MAX_IMAGE_BYTES: raise ValueError('Imagen demasiado grande: '+os.path.basename(name))
+            if len(images)>=MAX_IMAGES: raise ValueError('Hay más de 350 fotografías.')
+            total+=entry.file_size
+            if total>MAX_ZIP_BYTES: raise ValueError('Las imágenes descomprimidas superan 180 MB.')
+            content=z.read(entry)
+            if not content: continue
+            images[name]=content
+    return images
+
+def match_photos(images, df):
+    rows=[]
+    for path in images:
+        stem=norm(os.path.splitext(os.path.basename(path))[0]); hits=[]
+        for r in df.itertuples():
+            ref=norm(r.referencia)
+            # Referencia exacta o fila explícita; nunca adivinar por coincidencias parciales.
+            if ref in stem or re.search(r'(?<!\d)(?:fila|registro|hallazgo)[ _-]*0*'+str(r.fila_excel)+r'(?!\d)',stem):
+                hits.append(r.referencia)
+            elif clean(r.evidencia) and len(norm(r.evidencia))>=6 and norm(r.evidencia) in stem:
+                hits.append(r.referencia)
+        hits=list(dict.fromkeys(hits))
+        rows.append({'fotografia':path,'referencia':hits[0] if len(hits)==1 else '(Sin asignar)'})
+    return pd.DataFrame(rows)
+
+def upload_photo(token, filename, content):
+    signed=request('POST','/s3_object/',token,payload={'name':os.path.basename(filename),'size':len(content)})
+    d=signed.get('data') if isinstance(signed,dict) else None
+    required=('host','key','acl','policy','credential','date','signature')
+    if not isinstance(d,dict) or not all(d.get(x) for x in required):
+        raise RuntimeError('Fracttal no devolvió las credenciales completas de subida.')
+    fields=[('key',d['key']),('acl',d['acl']),('policy',d['policy']),('x-amz-credential',d['credential']),('x-amz-algorithm','AWS4-HMAC-SHA256'),('x-amz-date',d['date']),('x-amz-signature',d['signature']),('success_action_status','200')]
+    host=d['host']
+    if not host.startswith('https://'): raise RuntimeError('Destino de subida no seguro.')
+    res=requests.post(host,data=fields,files={'file':(os.path.basename(filename),io.BytesIO(content))},timeout=90)
+    if res.status_code not in (200,201,204): raise RuntimeError('No se pudo transferir la fotografía al almacenamiento (HTTP %s).' % res.status_code)
+    return d['key']
+
+def attach_photos(token, request_id, assigned, images):
+    paths=[]
+    for path in assigned:
+        key=upload_photo(token,path,images[path])
+        paths.append({'name':key,'description':'Evidencia de Calidad: '+os.path.basename(path)})
+    if paths:
+        request('POST',f'/work_requests_attachments_files/{int(request_id)}',token,payload={'id_status':1,'paths':paths})
+    return len(paths)
+
+def response_id(response):
+    data=response.get('data') if isinstance(response,dict) else None
+    if isinstance(data,list) and len(data)==1: data=data[0]
+    if isinstance(data,dict) and data.get('id_code') is not None:
+        return int(data['id_code'])
+    return None
 
 upload=st.file_uploader('1 · Selecciona el Excel original del Departamento de Calidad',type=['xlsx'])
 if upload is None:
@@ -156,6 +265,54 @@ selected_refs=set(edited.loc[edited['seleccion']==True,'referencia'].tolist())
 selected=df[df.referencia.isin(selected_refs)].copy()
 st.caption(f'Seleccionadas para revisión: {len(selected)}. Cada hallazgo conservará una referencia estable para evitar duplicados.')
 if selected.empty:st.stop()
+
+st.subheader('3B · Fotografías de las incidencias (opcional)')
+photo_zip=st.file_uploader('Opción A · ZIP con fotografías de Calidad',type=['zip'],key='photos_zip')
+gallery_files=st.file_uploader('Opción B · Selecciona fotos directamente desde la galería o Archivos (sin ZIP)',type=['jpg','jpeg','png','gif','bmp','tif','tiff'],accept_multiple_files=True,key='photos_gallery',help='En iPad, pulsa Browse files / Examinar archivos y selecciona Fototeca si Safari ofrece esa opción. También puedes elegir fotos guardadas en Archivos.')
+images={}; photo_map={}; photo_error=False
+try:
+    if photo_zip is not None:
+        images.update(load_photos(photo_zip.getvalue()))
+    if gallery_files:
+        if len(images)+len(gallery_files)>MAX_IMAGES:
+            raise ValueError('Se supera el máximo de 350 fotografías.')
+        total_bytes=sum(len(v) for v in images.values())
+        for i,f in enumerate(gallery_files,1):
+            content=f.getvalue()
+            if len(content)>MAX_IMAGE_BYTES:
+                raise ValueError('Imagen demasiado grande: '+f.name)
+            total_bytes+=len(content)
+            if total_bytes>MAX_ZIP_BYTES:
+                raise ValueError('Las imágenes superan 180 MB en total.')
+            # El prefijo identifica la carga de galería y evita colisiones con nombres del ZIP.
+            name=f'Galeria/{i:03d}_{os.path.basename(f.name)}'
+            images[name]=content
+    if images:
+        st.caption(f'{len(images)} fotografías encontradas. Selecciona la referencia de cada una; ninguna se envía sin asignar.')
+        mapping=match_photos(images,df)
+        options=['(Sin asignar)']+df['referencia'].tolist()
+        fingerprint=hashlib.sha256(blob)
+        for name,content in images.items():
+            fingerprint.update(name.encode('utf-8'));fingerprint.update(hashlib.sha256(content).digest())
+        editor_key='photo_map_'+fingerprint.hexdigest()[:14]
+        mapping=st.data_editor(mapping,key=editor_key,hide_index=True,use_container_width=True,num_rows='fixed',disabled=['fotografia'],column_config={'referencia':st.column_config.SelectboxColumn('Incidencia / referencia',options=options,required=True),'fotografia':st.column_config.TextColumn('Archivo',width='large')})
+        for r in mapping.itertuples():
+            if r.referencia!='(Sin asignar)': photo_map.setdefault(r.referencia,[]).append(r.fotografia)
+        linked=sum(len(v) for v in photo_map.values())
+        st.info(f'Fotografías vinculadas: {linked} de {len(images)}. Sin vincular: {len(images)-linked}.')
+        with st.expander('Vista previa de fotografías asociadas',expanded=bool(gallery_files)):
+            for r in mapping.itertuples():
+                if r.referencia!='(Sin asignar)':
+                    st.write(f'{r.fotografia} → {r.referencia}')
+                    if os.path.splitext(r.fotografia)[1].lower() in ('.jpg','.jpeg','.png','.gif'):
+                        st.image(images[r.fotografia],width=260)
+        selected_photo_count=sum(len(photo_map.get(ref,[])) for ref in selected_refs)
+        st.caption(f'Fotografías que se intentarán adjuntar a las solicitudes seleccionadas: {selected_photo_count}.')
+    elif photo_zip is not None:
+        st.warning('El ZIP no contiene fotografías compatibles.')
+except Exception as exc:
+    st.error('No se pudieron preparar las fotografías: '+str(exc));photo_error=True
+if photo_error: st.stop()
 
 st.subheader('4 · Configuración de Fracttal')
 def_user=sec('FRACTTAL_REQUEST_USER_CODE')
@@ -213,11 +370,24 @@ if st.button('🚀 Crear solicitudes seleccionadas',type='primary',disabled=not 
                 try:
                     response=request('POST','/work_requests/',tk,payload=body_of(row,user_code.strip(),requested_by.strip(),urgency.startswith('Urgente')))
                     confirmed_remote=bool(isinstance(response,dict) and response.get('success') is True and response.get('data'))
-                    results.append({'referencia':ref,'resultado':'Creada' if confirmed_remote else 'Respuesta sin confirmación','detalle':''})
-                    if confirmed_remote:current_refs.add(ref)
+                    if not confirmed_remote:
+                        results.append({'referencia':ref,'resultado':'Respuesta sin confirmación','detalle':'Comprobar en Fracttal'})
+                        st.error('Respuesta de creación sin confirmación. Verifica Fracttal antes de continuar.');break
+                    current_refs.add(ref)
+                    photos=photo_map.get(ref,[])
+                    if photos:
+                        req_id=response_id(response)
+                        if req_id is None:
+                            results.append({'referencia':ref,'resultado':'Solicitud creada; fotos pendientes','detalle':'La respuesta no incluye id_code. Revisar en Fracttal antes de reintentar.'})
+                            st.error('Solicitud creada, pero falta id_code para adjuntar fotos. Se detiene el proceso.');break
+                        try:
+                            n=attach_photos(tk,req_id,photos,images)
+                            results.append({'referencia':ref,'resultado':f'Creada con {n} foto(s)','detalle':''})
+                        except Exception as attach_error:
+                            results.append({'referencia':ref,'resultado':'Solicitud creada; adjuntos pendientes','detalle':str(attach_error)[:180]})
+                            st.error('Solicitud creada, pero falló la asociación de fotografías. No vuelvas a crearla: revisa Fracttal y el informe.');break
                     else:
-                        # Si la respuesta no confirma, no continuamos para evitar duplicados.
-                        st.error('Respuesta de creación sin confirmación suficiente. Verifica Fracttal antes de continuar.');break
+                        results.append({'referencia':ref,'resultado':'Creada sin fotografías','detalle':''})
                 except Exception as e:
                     results.append({'referencia':ref,'resultado':'Error / comprobar en Fracttal','detalle':str(e)[:180]})
                     st.error('Se ha detenido la importación para evitar duplicados. Comprueba la solicitud antes de reintentar.');break
@@ -229,4 +399,4 @@ if st.button('🚀 Crear solicitudes seleccionadas',type='primary',disabled=not 
             st.session_state.pop('audit_check',None)
     except Exception as e:st.error(str(e))
 
-st.caption('Fuente: Excel del Departamento de Calidad. API oficial: https://api.fracttal.com/es/reference/crear-una-nueva-solicitud')
+st.caption('Las fotografías solo se transfieren al confirmar la creación. Si falla un adjunto, la solicitud ya creada NO se repite. Fuente: Excel del Departamento de Calidad. API oficial: https://api.fracttal.com/es/reference/crear-una-nueva-solicitud')
