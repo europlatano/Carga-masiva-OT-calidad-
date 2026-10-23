@@ -13,10 +13,10 @@ import streamlit as st
 
 API = 'https://app.fracttal.com/api'
 TOKEN_URL = 'https://one.fracttal.com/oauth/token'
-APP_VER = '2.5'
+APP_VER = '2.6'
 st.set_page_config(page_title='Calidad → Fracttal | Europlátano', page_icon='📋', layout='wide')
 st.title('📋 Auditorías de Calidad → Solicitudes Fracttal')
-st.caption(f'Europlátano · V{APP_VER} · Usuarios con cuenta activa · fechas · fotos · clasificación · IFS / GLOBALG.A.P. · No crea órdenes de trabajo')
+st.caption(f'Europlátano · V{APP_VER} · Solicitante automático por incidencia · fotos recuperables · fechas · clasificación · IFS / GLOBALG.A.P. · No crea órdenes de trabajo')
 
 def sec(k):
     try: return str(st.secrets.get(k,'')).strip()
@@ -43,6 +43,24 @@ def norm(v):
     s=unicodedata.normalize('NFKD',str(v or ''))
     return ''.join(c for c in s if not unicodedata.combining(c)).strip().lower()
 
+PARTICULAS_NOMBRE = {'de', 'del', 'la', 'las', 'los', 'el', 'y'}
+
+def codigo_por_iniciales(nombre):
+    """Normaliza tildes/capitalización y omite partículas de nombres/apellidos."""
+    if not isinstance(nombre, str):
+        return ''
+    partes = re.findall(r'[a-z]+', norm(nombre))
+    return ''.join(p[0].upper() for p in partes if p not in PARTICULAS_NOMBRE)
+
+def columna_reportado_por(frame):
+    """Busca el encabezado de la columna opcional sin depender de su posición."""
+    aceptadas = {'reportado por', 'reportada por', 'persona que reporta',
+                 'nombre y apellidos del reportante', 'solicitante calidad'}
+    for col in frame.columns:
+        if re.sub(r'\s+', ' ', norm(col).replace('_',' ')) in aceptadas:
+            return col
+    return None
+
 def dtstr(v):
     if isinstance(v,(datetime,date)): return v.strftime('%Y-%m-%d')
     if pd.isna(v):return ''
@@ -61,6 +79,7 @@ def ident(date_val, area, incidence, occurrence, plant_code):
 def extract(blob, plant_code):
     frame=pd.read_excel(io.BytesIO(blob),sheet_name=0,header=1,engine='openpyxl',dtype=object)
     if frame.shape[1]<10: raise ValueError('El Excel no contiene las diez columnas esperadas de Calidad.')
+    reportador_col=columna_reportado_por(frame)
     result=[]; occurred=Counter()
     for ix,raw in frame.iterrows():
         row=list(raw.values)
@@ -68,12 +87,14 @@ def extract(blob, plant_code):
         if not incident or not day: continue
         signature=(day,norm(area),norm(incident));occurred[signature]+=1
         ref=ident(row[1],area,incident,occurred[signature],plant_code)
+        reportado_por=clean(raw[reportador_col]) if reportador_col is not None else ''
         maintenance='mantenimiento' in norm(dept)
         opened=norm(status) in ('abierta','abierto','pendiente')
         result.append(dict(fila_excel=int(ix)+3,referencia=ref,fecha=day,zona=area,
           incidencia=incident,accion_calidad=clean(row[4]),evidencia=clean(row[5]),
           responsable=dept,fecha_prevista=dtstr(row[7]),fecha_cierre=dtstr(row[8]),
-          estado=status,observaciones=clean(row[10]) if len(row)>10 else '',
+          estado=status,reportado_por=reportado_por,codigo_sugerido=codigo_por_iniciales(reportado_por),
+          observaciones=clean(row[10]) if len(row)>10 else '',
           seleccion=bool(opened and maintenance),revision=('Seleccionada' if opened and maintenance else 'No seleccionada')))
     return pd.DataFrame(result)
 
@@ -744,6 +765,33 @@ urgency=st.selectbox('Urgencia por defecto', ['No urgente (recomendado)','Urgent
 st.caption('Cada solicitud se asociará al activo provisional de su planta. Grupo, C1 y C2 se seleccionan por incidencia en el apartado 3A.')
 if not user_code.strip() or not requested_by.strip(): st.warning('Selecciona o introduce un código de usuario y completa el solicitante para continuar.');st.stop()
 
+st.subheader('4B · Solicitante por incidencia (opcional)')
+st.caption('Si el Excel incluye «Reportado por», se calcula automáticamente el código con las iniciales, omitiendo de, del, la, las, los, el e y. Puedes corregir nombres y códigos. Para las filas sin nombre se utiliza el solicitante general del apartado 4.')
+users_table=pd.DataFrame([{
+    'referencia':str(r.referencia), 'fila_excel':int(r.fila_excel),
+    'reportado_por':str(r.reportado_por), 'user_code':str(r.codigo_sugerido)
+} for r in selected.itertuples()])
+users_edited=st.data_editor(users_table,hide_index=True,use_container_width=True,num_rows='fixed',
+    disabled=['referencia','fila_excel'], key='quality_reporters_'+hashlib.sha256(blob+plant_code.encode()).hexdigest()[:12],
+    column_config={'user_code':st.column_config.TextColumn('Código Fracttal (editable)'),
+                   'reportado_por':st.column_config.TextColumn('Reportado por (Excel; editable)'),
+                   'fila_excel':st.column_config.NumberColumn('Fila Excel'),
+                   'referencia':st.column_config.TextColumn('Referencia')})
+reporters={}
+for _,r in users_edited.iterrows():
+    name=str(r['reportado_por']).strip()
+    code=str(r['user_code']).strip().upper()
+    if code.lower() in ('nan','none'): code=''
+    if name.lower() in ('nan','none'):name=''
+    # Cuando se introduce nombre nuevo pero falta código, calcular automáticamente.
+    if name and not code: code=codigo_por_iniciales(name)
+    reporters[str(r['referencia'])]=(code if name else user_code.strip(),name if name else requested_by.strip())
+invalid_reporters=[ref for ref,(code,name) in reporters.items() if not re.fullmatch(r'[A-Z0-9_-]{1,40}',code)]
+if invalid_reporters:
+    st.error('Hay incidencias con código de solicitante vacío o inválido. Corrige la tabla: '+', '.join(invalid_reporters[:4]));st.stop()
+if any(str(r.reportado_por).strip() for r in selected.itertuples()):
+    st.info('Los códigos derivados de las iniciales son propuestas. Fracttal debe tener esos códigos dados de alta como usuarios con cuenta. Se interrumpirá el lote si rechaza alguno.')
+
 st.subheader('5 · Comprobar duplicados (solo lectura)')
 filetag=hashlib.sha256(blob+plant_code.encode()).hexdigest()[:12]
 if st.button('🔎 Consultar solicitudes existentes en Fracttal'):
@@ -803,10 +851,10 @@ if new.empty:
     st.success('No hay nuevas solicitudes que crear. Puedes recuperar sus fotografías en el apartado 5B.');st.stop()
 with st.expander('Diagnóstico de la petición POST (sin datos personales ni texto del hallazgo)'):
     g,c1,c2=class_by_ref[str(new.iloc[0]['referencia'])]
-    sample=body_of(new.iloc[0],user_code.strip(),requested_by.strip(),urgency.startswith('Urgente'),plant_name,asset_code,g,c1,c2)
+    sample=body_of(new.iloc[0],*reporters[str(new.iloc[0]['referencia'])],urgency.startswith('Urgente'),plant_name,asset_code,g,c1,c2)
     st.write('Endpoint: POST /work_requests/')
     st.write('Campos enviados:', ', '.join(sorted(sample.keys())))
-    st.write('user_code:', sample['user_code'])
+    st.write('user_code (de esta incidencia):', sample['user_code'])
     st.write('user_type:', sample['user_type'])
     st.write('code (activo):', sample['code'])
     st.write('Grupo:', sample['types_description'])
@@ -816,6 +864,9 @@ with st.expander('Diagnóstico de la petición POST (sin datos personales ni tex
 with st.expander('Vista previa: datos que se enviarán a Fracttal'):
     preview=new[['referencia','fecha','zona','incidencia','accion_calidad']].copy()
     preview[['Grupo','C1','C2']]=preview['referencia'].apply(lambda ref:pd.Series(class_by_ref[ref]))
+    preview['Reportado por']=preview['referencia'].map(lambda ref:reporters[ref][1])
+    preview['Código usuario']=preview['referencia'].map(lambda ref:reporters[ref][0])
+    preview['Fotografías previstas']=preview['referencia'].map(lambda ref:len(photo_map.get(ref,[])))
     st.dataframe(preview,hide_index=True,use_container_width=True)
 
 st.subheader('6 · Crear solicitudes')
@@ -831,10 +882,13 @@ else:
     target=new
 missing_photos=[r['referencia'] for _,r in target.iterrows() if not photo_map.get(r['referencia'])]
 if missing_photos:
-    st.error(f'Hay {len(missing_photos)} incidencia(s) sin fotografía asignada. Para garantizar evidencias, asigna al menos una fotografía a cada solicitud antes de crearla.');st.stop()
+    st.warning(f'Hay {len(missing_photos)} incidencia(s) sin fotografía. Puedes crearlas ahora y adjuntar las fotografías después desde 5B, sin duplicarlas.')
+    accept_pending=st.checkbox('Autorizo crear también las solicitudes sin fotografía y adjuntarlas posteriormente',key='quality_accept_without_photos')
+else:
+    accept_pending=True
 confirmed=st.checkbox('He comprobado las incidencias y autorizo crear solicitudes reales en Fracttal')
 confirmation=st.text_input('Escribe CREAR SOLICITUDES para confirmar',value='')
-allowed=confirmed and confirmation.strip()=='CREAR SOLICITUDES'
+allowed=confirmed and accept_pending and confirmation.strip()=='CREAR SOLICITUDES'
 if st.button('🚀 Crear solicitudes seleccionadas',type='primary',disabled=not allowed):
     results=[]
     try:
@@ -847,7 +901,7 @@ if st.button('🚀 Crear solicitudes seleccionadas',type='primary',disabled=not 
                 results.append({'referencia':ref,'resultado':'Omitida: ya existe','detalle':''})
             else:
                 try:
-                    response=request('POST','/work_requests/',tk,payload=body_of(row,user_code.strip(),requested_by.strip(),urgency.startswith('Urgente'),plant_name,asset_code,*class_by_ref[ref]))
+                    response=request('POST','/work_requests/',tk,payload=body_of(row,*reporters[ref],urgency.startswith('Urgente'),plant_name,asset_code,*class_by_ref[ref]))
                     confirmed_remote=bool(isinstance(response,dict) and response.get('success') is True and response.get('data'))
                     if not confirmed_remote:
                         results.append({'referencia':ref,'resultado':'Respuesta sin confirmación','detalle':'Comprobar en Fracttal'})
@@ -866,7 +920,7 @@ if st.button('🚀 Crear solicitudes seleccionadas',type='primary',disabled=not 
                             results.append({'referencia':ref,'resultado':'Solicitud creada; adjuntos pendientes','detalle':str(attach_error)[:180]})
                             st.error('Solicitud creada, pero falló la asociación de fotografías. No vuelvas a crearla: revisa Fracttal y el informe.');break
                     else:
-                        results.append({'referencia':ref,'resultado':'Creada sin fotografías','detalle':''})
+                        results.append({'referencia':ref,'resultado':'Creada; fotografías pendientes','detalle':'Adjuntar posteriormente desde 5B con el mismo Excel y una foto asignada a esta referencia.'})
                 except Exception as e:
                     results.append({'referencia':ref,'resultado':'Error / comprobar en Fracttal','detalle':str(e)[:1200]})
                     st.error('Fracttal ha rechazado la petición o no se ha podido confirmar. Lee la columna detalle para conocer la validación y comprueba la solicitud antes de reintentar.');break
@@ -878,5 +932,5 @@ if st.button('🚀 Crear solicitudes seleccionadas',type='primary',disabled=not 
             st.session_state.pop('audit_check',None)
     except Exception as e:st.error(str(e))
 
-st.caption('Versión 2.5 · Desplegable de solicitantes · Fechas inclusivas, fotos asociadas por coincidencias fiables y Grupo/C1/C2 independientes por incidencia. Recuperación de fotografías existentes.')
-st.caption('Las fotografías solo se transfieren al confirmar la creación. Si falla un adjunto, la solicitud ya creada NO se repite. Fuente: Excel del Departamento de Calidad. API oficial: https://api.fracttal.com/es/reference/crear-una-nueva-solicitud')
+st.caption('Versión 2.6 · Solicitante por incidencia desde Excel · Fotografías opcionales durante la creación y recuperables en 5B · Filtro de fechas y Grupo/C1/C2 individual.')
+st.caption('Puedes crear sin fotos y asociarlas después desde 5B. Si falla un adjunto, la solicitud ya creada NO se repite. Fuente: Excel del Departamento de Calidad. API oficial: https://api.fracttal.com/es/reference/crear-una-nueva-solicitud')
