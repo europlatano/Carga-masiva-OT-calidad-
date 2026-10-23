@@ -13,10 +13,10 @@ import streamlit as st
 
 API = 'https://app.fracttal.com/api'
 TOKEN_URL = 'https://one.fracttal.com/oauth/token'
-APP_VER = '2.4'
+APP_VER = '2.5'
 st.set_page_config(page_title='Calidad → Fracttal | Europlátano', page_icon='📋', layout='wide')
 st.title('📋 Auditorías de Calidad → Solicitudes Fracttal')
-st.caption(f'Europlátano · V{APP_VER} · Fechas · fotos automáticas · clasificación por incidencia · IFS / GLOBALG.A.P. · No crea órdenes de trabajo')
+st.caption(f'Europlátano · V{APP_VER} · Usuarios con cuenta activa · fechas · fotos · clasificación · IFS / GLOBALG.A.P. · No crea órdenes de trabajo')
 
 def sec(k):
     try: return str(st.secrets.get(k,'')).strip()
@@ -142,30 +142,62 @@ def fetch_paged(token, endpoint):
     raise RuntimeError('Límite de paginación superado en '+endpoint)
 
 def available_requesters(token):
-    """Lista códigos reales de personal sin depender de /accounts/.
+    """Obtiene recursos humanos y solo ofrece cuentas de Fracttal activas.
 
-    El catálogo de personal no demuestra que exista una cuenta de acceso.
-    Fracttal validará el user_code al crear una única solicitud de prueba.
+    /accounts/ no está permitido a esta integración. La documentación
+    oficial expone account_active a través de /personnel/.
     """
-    endpoints=('/personnel/','/human_resources/')
-    errors=[]
-    for endpoint in endpoints:
-        try:
-            personnel=fetch_paged(token,endpoint)
-        except Exception as exc:
-            errors.append(f'{endpoint}: {str(exc)[:180]}')
+    personnel=fetch_paged(token,'/personnel/')
+    accounts=[]
+    seen=set()
+    unknown=0
+    for person in personnel:
+        if not isinstance(person,dict) or person.get('active') is False:
             continue
-        found=[];codes=set()
-        for person in personnel:
-            if not isinstance(person,dict) or person.get('active') is False:
-                continue
-            code=str(person.get('code') or person.get('code_personnel') or '').strip()
-            if not code or code in codes: continue
-            codes.add(code)
-            name=str(person.get('full_name') or person.get('name') or ' '.join(filter(None,[str(person.get('first_name') or '').strip(),str(person.get('last_name') or '').strip()])) or code).strip()
-            found.append({'nombre':name,'codigo':code})
-        return sorted(found,key=lambda u:(norm(u['nombre']),u['codigo'])),endpoint
-    raise RuntimeError('No se ha podido consultar el catálogo de personal. '+' | '.join(errors))
+        if person.get('account_active') is not True:
+            if person.get('account_active') is None:
+                unknown+=1
+            continue
+        code=str(person.get('code') or '').strip()
+        if not code or code in seen: continue
+        seen.add(code)
+        name=str(person.get('full_name') or person.get('name') or ' '.join(filter(None,[str(person.get('first_name') or '').strip(),str(person.get('last_name') or '').strip()])) or code).strip()
+        accounts.append({'nombre':name,'codigo':code})
+    return sorted(accounts,key=lambda p:(norm(p['nombre']),p['codigo'])),len(personnel),unknown
+
+
+def requesters_from_csv(blob):
+    """Alternativa de catálogo si /personnel/ está restringido por Fracttal.
+
+    Se interpreta un fichero preparado por el usuario o exportado de Fracttal.
+    Los códigos se validan de verdad al crear la primera solicitud.
+    """
+    try:
+        df=pd.read_csv(io.BytesIO(blob),sep=None,engine='python',dtype=str,encoding='utf-8-sig')
+    except UnicodeDecodeError:
+        df=pd.read_csv(io.BytesIO(blob),sep=None,engine='python',dtype=str,encoding='latin1')
+    aliases={
+        'nombre':{'nombre','name','full_name','nombre completo','nombres y apellidos','usuario'},
+        'codigo':{'codigo','code','user_code','codigo usuario','codigo recurso humano'},
+        'activo':{'account_active','cuenta activa','cuenta habilitada','habilitado','active'},
+    }
+    columns={}
+    for key,names in aliases.items():
+        for col in df.columns:
+            if norm(col).replace('_',' ') in {norm(n).replace('_',' ') for n in names}:
+                columns[key]=col;break
+    if 'nombre' not in columns or 'codigo' not in columns:
+        raise ValueError('El CSV debe contener las columnas Nombre y Código (o full_name y code).')
+    people=[];seen=set()
+    for _,row in df.iterrows():
+        name=str(row[columns['nombre']] or '').strip();code=str(row[columns['codigo']] or '').strip()
+        if not name or not code or name.lower()=='nan' or code.lower()=='nan' or code in seen: continue
+        if 'activo' in columns:
+            enabled=norm(row[columns['activo']])
+            if enabled not in ('true','1','si','yes','activo','habilitado'):continue
+        people.append({'nombre':name,'codigo':code});seen.add(code)
+    if not people: raise ValueError('El CSV no contiene usuarios seleccionables.')
+    return sorted(people,key=lambda p:(norm(p['nombre']),p['codigo']))
 
 def fetch_all(token, *, with_items=False):
     """Recorre todas las páginas usando start/limit oficiales de Fracttal.
@@ -644,40 +676,72 @@ except Exception as exc:
 if photo_error: st.stop()
 
 st.subheader('4 · Configuración de Fracttal')
-st.caption('Consulta el personal de Fracttal para seleccionar su código, o introdúcelo manualmente si la API no permite listar personal. El catálogo no garantiza que la persona tenga cuenta activa.')
-if st.button('👥 Cargar / actualizar listado de personal de Fracttal',key='load_requesters'):
+st.caption('Selecciona quién reporta las solicitudes. Fracttal identifica al solicitante por su código de recurso humano (user_code).')
+if st.button('👥 Consultar usuarios con cuenta activa',key='load_requesters'):
     try:
-        people,source=available_requesters(oauth())
+        people,total,unknown=available_requesters(oauth())
         st.session_state['quality_requesters']=people
-        st.session_state['quality_requesters_source']=source
-        if not people:
-            st.warning('El catálogo no devuelve personas con código. Puedes introducir un código manualmente.')
+        st.session_state['quality_requesters_source']='API de Fracttal /personnel/'
+        st.session_state.pop('quality_users_error',None)
+        if people:
+            st.success(f'Usuarios con cuenta activa: {len(people)} (entre {total} recursos humanos).')
         else:
-            st.success(f'Se han cargado {len(people)} personas desde {source}.')
+            st.warning('Fracttal permitió consultar personal, pero no devolvió cuentas habilitadas verificables. Puedes cargar un CSV o usar un código manual.')
+        if unknown:
+            st.caption(f'{unknown} recursos no informaron account_active y no se muestran como cuentas verificadas.')
     except Exception as exc:
         st.session_state.pop('quality_requesters',None)
-        st.warning('No se pudo consultar el listado. Puedes usar el código manual. Detalle: '+str(exc))
+        st.session_state['quality_users_error']=str(exc)[:300]
+        st.warning('Fracttal no permite consultar el listado con esta integración. Puedes cargar un CSV de usuarios como alternativa.')
+        st.caption('Detalle técnico: '+st.session_state['quality_users_error'])
+
+with st.expander('Alternativa si Fracttal bloquea la consulta: importar lista de usuarios CSV'):
+    st.caption('Archivo local con columnas Nombre,Código y opcionalmente Cuenta activa. No se guarda en GitHub ni se utiliza para crear cuentas. Comprueba que los códigos corresponden a usuarios habilitados.')
+    manual_users_file=st.file_uploader('Listado de usuarios CSV',type=['csv'],key='users_csv')
+    if manual_users_file is not None and st.button('📋 Cargar usuarios del CSV',key='load_users_csv'):
+        try:
+            people=requesters_from_csv(manual_users_file.getvalue())
+            st.session_state['quality_requesters']=people
+            st.session_state['quality_requesters_source']='CSV aportado por el usuario (cuentas no verificadas mediante API)'
+            st.success(f'Se han cargado {len(people)} usuarios para el desplegable.')
+        except Exception as exc:st.error('No se pudo cargar el CSV: '+str(exc))
+
 people=st.session_state.get('quality_requesters',[])
+source=st.session_state.get('quality_requesters_source','')
 mode=st.radio('Cómo elegir el solicitante',
-    ['Seleccionar del listado de personal','Introducir código de usuario manualmente'],
+    ['Elegir del desplegable','Introducir código manualmente'],
     index=0 if people else 1,key='quality_requester_mode')
 user_code=''
-if mode=='Seleccionar del listado de personal':
+selected_person_name=''
+if mode=='Elegir del desplegable':
     if people:
-        selected_person=st.selectbox('Persona solicitante en Fracttal',
-            range(len(people)),format_func=lambda i:f"{people[i]['nombre']} · {people[i]['codigo']}")
-        user_code=people[selected_person]['codigo']
-        st.caption('Código seleccionado: '+user_code+' · La existencia de una cuenta activa se validará al crear la solicitud.')
+        codes=[p['codigo'] for p in people]
+        default_idx=codes.index('ARM') if 'ARM' in codes else 0
+        selected_code=st.selectbox('Usuario que reporta a Fracttal',codes,
+            index=default_idx,format_func=lambda code:next((p['nombre']+' · '+p['codigo'] for p in people if p['codigo']==code),code),key='quality_selected_user')
+        user_code=selected_code
+        selected_person_name=next((p['nombre'] for p in people if p['codigo']==user_code),'')
+        st.caption('Fuente: '+source+' · Código enviado a Fracttal: '+user_code)
     else:
-        st.info('Primero pulsa «Cargar / actualizar listado» o elige introducir el código manualmente.')
+        st.warning('Aún no hay usuarios cargados. Pulsa «Consultar usuarios», importa un CSV o selecciona la entrada manual.')
 else:
-    user_code=st.text_input('Código de usuario de Fracttal (user_code)',value='ARM',
-        help='Introduce el código exacto de un usuario con cuenta en Fracttal; no el correo ni el nombre.').strip()
-    st.warning('No es posible confirmar previamente desde este formulario si el código tiene una cuenta activa. Realiza una sola solicitud de prueba.')
-requested_by=st.text_input('Solicitante (texto que aparecerá en la solicitud)',value='Departamento de Calidad – Europlátano')
+    user_code=st.text_input('Código de usuario en Fracttal (user_code)',value='ARM',
+        help='Debe coincidir con el código del recurso humano que tiene una cuenta de usuario habilitada.').strip()
+    st.caption('Código manual: no se verifica mediante listado. ARM se comprobó en la cuenta de Fracttal facilitada.')
+
+if selected_person_name:
+    st.info('Solicitante elegido: **'+selected_person_name+'** (código '+user_code+').')
+    if st.session_state.get('quality_previous_selected_code') != user_code:
+        st.session_state['quality_requested_by']=selected_person_name
+    st.session_state['quality_previous_selected_code']=user_code
+else:
+    st.session_state['quality_previous_selected_code']=None
+requested_by=st.text_input('Texto «Solicitado por» de la solicitud',
+    value=selected_person_name if selected_person_name else 'Departamento de Calidad – Europlátano',
+    help='Puedes cambiar este texto. El usuario autenticado asociado a la solicitud se establece con user_code.',
+    key='quality_requested_by')
 urgency=st.selectbox('Urgencia por defecto', ['No urgente (recomendado)','Urgente (solo si procede)'])
-st.caption('Cada solicitud se asociará al activo provisional de su planta. Grupo, C1 y C2 son los seleccionados por incidencia en el apartado 3A.')
-st.info('El código ARM se ha confirmado como recurso humano y cuenta habilitada en Fracttal. Esto no garantiza que la API acepte todos los campos de la petición.')
+st.caption('Cada solicitud se asociará al activo provisional de su planta. Grupo, C1 y C2 se seleccionan por incidencia en el apartado 3A.')
 if not user_code.strip() or not requested_by.strip(): st.warning('Selecciona o introduce un código de usuario y completa el solicitante para continuar.');st.stop()
 
 st.subheader('5 · Comprobar duplicados (solo lectura)')
@@ -814,5 +878,5 @@ if st.button('🚀 Crear solicitudes seleccionadas',type='primary',disabled=not 
             st.session_state.pop('audit_check',None)
     except Exception as e:st.error(str(e))
 
-st.caption('Versión 2.4 · Fechas inclusivas, fotos asociadas por coincidencias fiables y Grupo/C1/C2 independientes por incidencia. Recuperación de fotografías existentes.')
+st.caption('Versión 2.5 · Desplegable de solicitantes · Fechas inclusivas, fotos asociadas por coincidencias fiables y Grupo/C1/C2 independientes por incidencia. Recuperación de fotografías existentes.')
 st.caption('Las fotografías solo se transfieren al confirmar la creación. Si falla un adjunto, la solicitud ya creada NO se repite. Fuente: Excel del Departamento de Calidad. API oficial: https://api.fracttal.com/es/reference/crear-una-nueva-solicitud')
