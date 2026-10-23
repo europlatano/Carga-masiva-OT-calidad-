@@ -12,10 +12,10 @@ import streamlit as st
 
 API = 'https://app.fracttal.com/api'
 TOKEN_URL = 'https://one.fracttal.com/oauth/token'
-APP_VER = '2.0'
+APP_VER = '2.1'
 st.set_page_config(page_title='Calidad → Fracttal | Europlátano', page_icon='📋', layout='wide')
 st.title('📋 Auditorías de Calidad → Solicitudes Fracttal')
-st.caption(f'Europlátano · V{APP_VER} · Diagnóstico de petición · IFS / GLOBALG.A.P. · No crea órdenes de trabajo')
+st.caption(f'Europlátano · V{APP_VER} · Fotografías y recuperación · IFS / GLOBALG.A.P. · No crea órdenes de trabajo')
 
 def sec(k):
     try: return str(st.secrets.get(k,'')).strip()
@@ -166,7 +166,7 @@ def available_requesters(token):
         return sorted(found,key=lambda u:(norm(u['nombre']),u['codigo'])),endpoint
     raise RuntimeError('No se ha podido consultar el catálogo de personal. '+' | '.join(errors))
 
-def fetch_all(token):
+def fetch_all(token, *, with_items=False):
     """Recorre todas las páginas usando start/limit oficiales de Fracttal.
 
     Ante inconsistencias, se interrumpe sin habilitar ninguna escritura.
@@ -220,7 +220,7 @@ def fetch_all(token):
             refs.add(identifier)
         observation = str(item.get('observation') or '')
         refs.update(re.findall(r'CAL-IFS-[A-Z]{3}-[0-9A-F]{16}', observation, re.IGNORECASE))
-    return refs, len(found)
+    return (refs, len(found), found) if with_items else (refs, len(found))
 
 def title(row):
     text=re.sub(r'\s+',' ',str(row['incidencia'])).strip()
@@ -291,13 +291,36 @@ def upload_photo(token, filename, content):
     return d['key']
 
 def attach_photos(token, request_id, assigned, images):
+    """Sube y asocia fotos; verifica claves en la respuesta de Fracttal.
+
+    Si la respuesta es ambigua, NO reintentar automáticamente para evitar duplicados.
+    """
     paths=[]
     for path in assigned:
         key=upload_photo(token,path,images[path])
         paths.append({'name':key,'description':'Evidencia de Calidad: '+os.path.basename(path)})
-    if paths:
-        request('POST',f'/work_requests_attachments_files/{int(request_id)}',token,payload={'id_status':1,'paths':paths})
+    if not paths:
+        return 0
+    result=request('POST',f'/work_requests_attachments_files/{int(request_id)}',token,
+                   payload={'id_status':1,'paths':paths})
+    if not isinstance(result,dict) or result.get('success') is not True or not isinstance(result.get('data'),list):
+        raise RuntimeError('Asociación sin confirmación verificable; comprueba los adjuntos en Fracttal antes de reintentar.')
+    actual={str(a.get('path') or '') for a in result['data'] if isinstance(a,dict) and a.get('type') in (1,'1')}
+    missing=[p['name'] for p in paths if p['name'] not in actual]
+    if missing:
+        raise RuntimeError(f'Fracttal no confirmó {len(missing)} de {len(paths)} imágenes. Revisa antes de reintentar.')
     return len(paths)
+
+
+def request_reference(item):
+    """Referencia registrada en la solicitud, también para solicitudes antiguas."""
+    identifier=str(item.get('identifier') or '').strip()
+    if re.fullmatch(r'CAL-IFS-[A-Z]{3}-[0-9A-F]{16}',identifier,re.I):
+        return identifier.upper()
+    observation=str(item.get('observation') or '')
+    match=re.search(r'CAL-IFS-[A-Z]{3}-[0-9A-F]{16}',observation,re.I)
+    return match.group(0).upper() if match else ''
+
 
 def response_id(response):
     data=response.get('data') if isinstance(response,dict) else None
@@ -369,7 +392,7 @@ selected=df[df.referencia.isin(selected_refs)].copy()
 st.caption(f'Seleccionadas para revisión: {len(selected)}. Cada hallazgo conservará una referencia estable para evitar duplicados.')
 if selected.empty:st.stop()
 
-st.subheader('3B · Fotografías de las incidencias (opcional)')
+st.subheader('3B · Fotografías de las incidencias')
 photo_zip=st.file_uploader('Opción A · ZIP con fotografías de Calidad',type=['zip'],key='photos_zip')
 gallery_files=st.file_uploader('Opción B · Selecciona fotos directamente desde la galería o Archivos (sin ZIP)',type=['jpg','jpeg','png','gif','bmp','tif','tiff'],accept_multiple_files=True,key='photos_gallery',help='En iPad, pulsa Browse files / Examinar archivos y selecciona Fototeca si Safari ofrece esa opción. También puedes elegir fotos guardadas en Archivos.')
 images={}; photo_map={}; photo_error=False
@@ -464,8 +487,8 @@ st.subheader('5 · Comprobar duplicados (solo lectura)')
 filetag=hashlib.sha256(blob+plant_code.encode()).hexdigest()[:12]
 if st.button('🔎 Consultar solicitudes existentes en Fracttal'):
     try:
-        tk=oauth();refs,seen=fetch_all(tk)
-        st.session_state['audit_check']={'tag':filetag,'refs':refs,'total':seen,'time':datetime.now().isoformat()}
+        tk=oauth();refs,seen,items=fetch_all(tk,with_items=True)
+        st.session_state['audit_check']={'tag':filetag,'refs':refs,'total':seen,'items':items,'time':datetime.now().isoformat()}
         st.success(f'Consulta completada: {seen} solicitudes examinadas.')
     except Exception as e:
         st.session_state.pop('audit_check',None);st.error(str(e))
@@ -478,8 +501,45 @@ x,y=st.columns(2);x.metric('Pendientes de crear',len(new));y.metric('Ya existent
 if not duplicates.empty:
     with st.expander('Ver solicitudes ya registradas'):
         st.dataframe(duplicates[['referencia','zona','incidencia']],hide_index=True)
+st.subheader('5B · Adjuntar fotos a solicitudes ya existentes')
+st.caption('Sirve también para recuperar las dos solicitudes de prueba: NO vuelve a crearlas.')
+items=check.get('items',[])
+by_ref={}
+for item in items:
+    ref=request_reference(item)
+    if ref and ref not in by_ref:
+        by_ref[ref]=item
+recoverable=[]
+for row in duplicates.itertuples():
+    photos=photo_map.get(row.referencia,[])
+    item=by_ref.get(row.referencia)
+    if photos and item:
+        recoverable.append({'referencia':row.referencia,'id_code':item.get('id_code'),
+                            'fotografias':len(photos),'archivos':photos})
+if recoverable:
+    recovery_options=[f"{r['referencia']} · Solicitud {r['id_code']} · {r['fotografias']} foto(s)" for r in recoverable]
+    recovery_choice=st.selectbox('Solicitud existente a la que adjuntar fotografías',recovery_options)
+    recovery=recoverable[recovery_options.index(recovery_choice)]
+    st.warning('Antes de continuar, abre esta solicitud en Fracttal y comprueba que las fotos no estén ya adjuntas. Esta opción no elimina adjuntos previos.')
+    recovery_confirm=st.checkbox('He comprobado que estas fotografías todavía NO están adjuntas',key='confirm_recovery')
+    if st.button('📎 Adjuntar fotografías a esta solicitud existente',disabled=not recovery_confirm):
+        try:
+            tk=oauth()
+            # Confirmar que sigue existiendo y que su referencia coincide con la elegida.
+            _,_,fresh_items=fetch_all(tk,with_items=True)
+            matching=[x for x in fresh_items if request_reference(x)==recovery['referencia'] and str(x.get('id_code'))==str(recovery['id_code'])]
+            if len(matching)!=1:
+                raise RuntimeError('No se pudo confirmar de forma única la solicitud existente. No se adjuntó nada.')
+            n=attach_photos(tk,int(recovery['id_code']),recovery['archivos'],images)
+            st.success(f'Fracttal ha confirmado {n} fotografía(s) vinculadas a la solicitud {recovery["id_code"]}.')
+        except Exception as exc:
+            st.error('No se confirmó la vinculación: '+str(exc))
+            st.warning('No repitas el envío hasta comprobar en Fracttal si las fotos aparecen.')
+else:
+    st.info('No hay solicitudes ya existentes con fotografías vinculadas en esta carga. Selecciona una incidencia creada y asígnale sus fotos en el apartado 3B.')
+
 if new.empty:
-    st.success('No hay nuevas solicitudes que crear.');st.stop()
+    st.success('No hay nuevas solicitudes que crear. Puedes recuperar sus fotografías en el apartado 5B.');st.stop()
 with st.expander('Diagnóstico de la petición POST (sin datos personales ni texto del hallazgo)'):
     sample=body_of(new.iloc[0],user_code.strip(),requested_by.strip(),urgency.startswith('Urgente'),plant_name,asset_code,group,category1,category2)
     st.write('Endpoint: POST /work_requests/')
@@ -495,17 +555,20 @@ with st.expander('Vista previa: datos que se enviarán a Fracttal'):
     st.dataframe(new[['referencia','fecha','zona','incidencia','accion_calidad']],hide_index=True,use_container_width=True)
 
 st.subheader('6 · Crear solicitudes')
-st.warning('Esta acción CREA solicitudes REALES de trabajo. Hasta resolver la validación 400/404, SOLO se permite una solicitud de prueba.')
+st.warning('Esta acción CREA solicitudes REALES. Haz primero una prueba con fotografía y comprueba el resultado en Fracttal.')
 run_mode=st.radio('Alcance de la importación',['Una sola solicitud de prueba','Todas las seleccionadas que falten'],horizontal=False)
 if mode=='Introducir código de usuario manualmente' and run_mode!='Una sola solicitud de prueba':
     st.error('Con un código introducido manualmente, primero realiza una única solicitud de prueba.');st.stop()
 if run_mode!='Una sola solicitud de prueba':
-    st.error('Importación masiva deshabilitada temporalmente hasta confirmar la creación con Fracttal.');st.stop()
+    st.error('Importación masiva deshabilitada temporalmente hasta confirmar también los adjuntos con Fracttal.');st.stop()
 if run_mode=='Una sola solicitud de prueba':
     opts=[f"Fila {int(r.fila_excel)} · {str(r.zona)[:35]} · {str(r.incidencia)[:85]}" for r in new.itertuples()]
     chosen=st.selectbox('Incidencia de prueba',opts)
     target=new.iloc[[opts.index(chosen)]]
 else:target=new
+missing_photos=[r['referencia'] for _,r in target.iterrows() if not photo_map.get(r['referencia'])]
+if missing_photos:
+    st.error(f'Hay {len(missing_photos)} incidencia(s) sin fotografía asignada. Para garantizar evidencias, asigna al menos una fotografía a cada solicitud antes de crearla.');st.stop()
 confirmed=st.checkbox('He comprobado las incidencias y autorizo crear solicitudes reales en Fracttal')
 confirmation=st.text_input('Escribe CREAR SOLICITUDES para confirmar',value='')
 allowed=confirmed and confirmation.strip()=='CREAR SOLICITUDES'
@@ -552,5 +615,5 @@ if st.button('🚀 Crear solicitudes seleccionadas',type='primary',disabled=not 
             st.session_state.pop('audit_check',None)
     except Exception as e:st.error(str(e))
 
-st.caption('Versión 1.9 · Catálogo de personal y código manual · La cuenta del solicitante se valida en Fracttal al crear la solicitud de prueba. No muestra contraseñas ni tokens.')
+st.caption('Versión 2.1 · Fotografías obligatorias dentro del importador, sin exigirlas en la configuración global de Fracttal. Permite recuperar fotografías de solicitudes ya creadas.')
 st.caption('Las fotografías solo se transfieren al confirmar la creación. Si falla un adjunto, la solicitud ya creada NO se repite. Fuente: Excel del Departamento de Calidad. API oficial: https://api.fracttal.com/es/reference/crear-una-nueva-solicitud')
