@@ -13,10 +13,10 @@ import streamlit as st
 
 API = 'https://app.fracttal.com/api'
 TOKEN_URL = 'https://one.fracttal.com/oauth/token'
-APP_VER = '2.3'
+APP_VER = '2.4'
 st.set_page_config(page_title='Calidad → Fracttal | Europlátano', page_icon='📋', layout='wide')
 st.title('📋 Auditorías de Calidad → Solicitudes Fracttal')
-st.caption(f'Europlátano · V{APP_VER} · Compatibilidad rutas S3 · IFS / GLOBALG.A.P. · No crea órdenes de trabajo')
+st.caption(f'Europlátano · V{APP_VER} · Fechas · fotos automáticas · clasificación por incidencia · IFS / GLOBALG.A.P. · No crea órdenes de trabajo')
 
 def sec(k):
     try: return str(st.secrets.get(k,'')).strip()
@@ -263,20 +263,137 @@ def load_photos(blob):
             images[name]=content
     return images
 
+def photo_tokens(s):
+    """Normaliza etiquetas de imagen sin aceptar coincidencias ambiguas."""
+    value=norm(s)
+    value=re.sub(r'[^a-z0-9]+',' ',value)
+    return [x for x in value.split() if len(x)>=3 and x not in {
+        'jpg','jpeg','png','foto','fotos','img','imagen','imagenes','dsc','photo',
+        'auditoria','calidad','ifs','palomares','captura','whatsapp','image',
+        'del','las','los','una','uno','con','para','por','que','esta','este','lado'}]
+
+
 def match_photos(images, df):
+    """Solo asigna automáticamente coincidencias únicas y claras.
+
+    Reconoce referencia, fila indicada explícitamente, nombre de evidencia
+    suficientemente distintivo, o la fecha + texto distintivo del hallazgo.
+    Nunca asigna por orden de archivos ni por foto0001 a fila 1.
+    """
     rows=[]
     for path in images:
         stem=norm(os.path.splitext(os.path.basename(path))[0]); hits=[]
+        fullpath=norm(path)
+        label=os.path.splitext(os.path.basename(path))[0]
+        tokens=set(photo_tokens(label))
         for r in df.itertuples():
             ref=norm(r.referencia)
-            # Referencia exacta o fila explícita; nunca adivinar por coincidencias parciales.
-            if ref in stem or re.search(r'(?<!\d)(?:fila|registro|hallazgo)[ _-]*0*'+str(r.fila_excel)+r'(?!\d)',stem):
-                hits.append(r.referencia)
-            elif clean(r.evidencia) and len(norm(r.evidencia))>=6 and norm(r.evidencia) in stem:
-                hits.append(r.referencia)
-        hits=list(dict.fromkeys(hits))
-        rows.append({'fotografia':path,'referencia':hits[0] if len(hits)==1 else '(Sin asignar)'})
+            reason=None
+            if ref in fullpath:
+                reason='Referencia exacta'
+            elif re.search(r'(?<!\d)(?:fila|registro|hallazgo)[ _-]*0*'+str(r.fila_excel)+r'(?!\d)',stem):
+                reason='Número de fila explícito'
+            else:
+                evidence=norm(r.evidencia)
+                # Nunca se considera el texto genérico «Foto» como identificador.
+                if len(evidence)>=10 and len(set(photo_tokens(evidence)))>=2 and evidence in stem:
+                    reason='Evidencia del Excel'
+                else:
+                    incident_tokens=set(photo_tokens(r.incidencia))
+                    meaningful=tokens & incident_tokens
+                    datepart=str(r.fecha).replace('-','')
+                    altdate=str(r.fecha).replace('-','_')
+                    has_date=(datepart in re.sub('[^0-9]','',stem) or altdate in stem)
+                    if has_date and len(meaningful)>=3 and len(tokens)>=3:
+                        reason='Fecha y palabras del hallazgo'
+                    elif (len(meaningful)>=4 and len(tokens)>=4
+                          and len(meaningful)/max(len(tokens),1)>=0.70):
+                        reason='Texto distintivo del hallazgo'
+            if reason: hits.append((r.referencia,reason))
+        unique={ref:why for ref,why in hits}
+        if len(unique)==1:
+            ref,why=next(iter(unique.items()))
+            rows.append({'fotografia':path,'referencia':ref,'coincidencia':why})
+        else:
+            rows.append({'fotografia':path,'referencia':'(Sin asignar)',
+                         'coincidencia':'Varias posibles' if unique else 'Sin coincidencia fiable'})
     return pd.DataFrame(rows)
+
+# Reglas conservadoras de clasificación: se muestran y pueden editarse por fila.
+GROUP_OPTIONS=['Calidad / Ajuste / Especificación','Incidencia (sin paro)',
+    'Mejora / Solicitud (no avería)','Seguridad / Riesgo / Medioambiente','Avería (con paro)']
+CAT1_OPTIONS=['Infraestructura y edificio','Aire comprimido y neumática',
+    'Automatización y control (PLC, HMI, variadores, sensores)',
+    'Electricidad potencia (cuadros, protecciones, motores)',
+    'Envasado / embolsado / sellado','Etiquetado / impresión',
+    'Frío industrial (cámaras/túnel)','Hidráulica / bombeo / fluidos',
+    'Lavado / agua de proceso / drenajes','Paletizado / flejado',
+    'Pesaje / control / detección','Transportadores y movimiento',
+    'Vehículos de transporte (carretera / recogida)',
+    'Vehículos industriales (carretillas, transpaletas, etc.)']
+CAT2_OPTIONS=['Otros / no sé','Alarma / error','Atasco / bloqueo','Está roto',
+    'Falta elemento/ inexistente','Falta nivel / falta presión / falta suministro',
+    'Funciona pero mal','Hace ruido anormal','Huele mal / quemado / humo',
+    'No funciona / no arranca','Pierde líquido / fuga','Roto / partido',
+    'Se calienta','Se para / falla a ratos','Suelto / desajustado','Vibra']
+
+def contains_any(text, terms):
+    return any(x in text for x in terms)
+
+def suggest_classification(row):
+    issue=norm(row['incidencia'])
+    zone=norm(row['zona'])
+    text=issue+' '+zone
+    # Prioridad a la naturaleza del hallazgo, no a términos aislados de su zona.
+    if contains_any(issue,['riesgo','peligro','accidente','proteccion','resbal','seguridad','barandilla','extintor','emergencia','incendio']):
+        group=GROUP_OPTIONS[3]
+    elif contains_any(issue,['averia','parada de linea','linea parada','no funciona','sin funcionar','no arranca']):
+        group=GROUP_OPTIONS[4]
+    elif contains_any(issue,['instalar','incorporar','mejorar','se solicita','ampliar','colocar una nueva','colocar un nuevo']):
+        group=GROUP_OPTIONS[2]
+    elif contains_any(issue,['fuga','gotea','pierde','roto','rota','rotura','deterior','desajust','averiad']):
+        group=GROUP_OPTIONS[1]
+    else:
+        group=GROUP_OPTIONS[0]
+
+    rules=[
+        (['compresor','neumatic','racor','presion de aire','aire comprimido','cilindro neumatic'],1),
+        (['plc','automata','sensor','fotocelula','inductivo','variador','pantalla hmi'],2),
+        (['cuadro electric','enchufe','interruptor','cable','iluminacion','luminaria','electri','magnetotermico'],3),
+        (['selladora','embolsa','flow pack','envasad','film'],4),
+        (['etiqueta','etiquetad','impresora','impresion','codificad'],5),
+        (['frigorif','evaporad','condensad','refriger','camara de maduracion','camara frigorifica','tunel de frio'],6),
+        (['bomba','hidrauli','deposito de agua','tuberia de agua','valvula de agua'],7),
+        (['lavado','lavadora','desague','drenaje','agua de proceso','boquilla de agua'],8),
+        (['paleti','flejadora','flejad','portico','pinza'],9),
+        (['bascula','pesaj','pesadora','detector de metal'],10),
+        (['transportador','cinta','banda','rodillo','cadena transportadora'],11),
+        (['camion','remolque','vehiculo de transporte'],12),
+        (['carretilla','transpaleta','apilador','montacargas'],13),
+    ]
+    c1=CAT1_OPTIONS[0]
+    for keys,i in rules:
+        if contains_any(issue,keys): c1=CAT1_OPTIONS[i];break
+    else:
+        # Área como pista secundaria si el texto del hallazgo no identifica máquina.
+        for keys,i in rules:
+            if contains_any(zone,keys): c1=CAT1_OPTIONS[i];break
+    if contains_any(issue,['no funciona','no arranca','no enciende','no trabaja']): c2='No funciona / no arranca'
+    elif contains_any(issue,['alarma','mensaje de error','codigo de error']): c2='Alarma / error'
+    elif contains_any(issue,['atascad','atasco','bloquead']): c2='Atasco / bloqueo'
+    elif contains_any(issue,['fuga','gote','pierde agua','pierde aceite','filtracion']): c2='Pierde líquido / fuga'
+    elif contains_any(issue,['humo','quemado','olor a quemado']): c2='Huele mal / quemado / humo'
+    elif contains_any(issue,['vibra']): c2='Vibra'
+    elif contains_any(issue,['ruido','chirrido']): c2='Hace ruido anormal'
+    elif contains_any(issue,['calienta','sobrecalent']): c2='Se calienta'
+    elif contains_any(issue,['intermitente','a ratos','se para']): c2='Se para / falla a ratos'
+    elif contains_any(issue,['suelto','aflojad','desajust','desnivel','flojo']): c2='Suelto / desajustado'
+    elif contains_any(issue,['roto','rota','rotura','fractura','partido','partida','rajad','grieta']): c2='Roto / partido'
+    elif contains_any(issue,['deteriorad','defectuos','funciona mal','mal funcionamiento']): c2='Funciona pero mal'
+    elif contains_any(issue,['falta','no existe','inexistente','ausencia','sin proteccion','carece de']): c2='Falta elemento/ inexistente'
+    else: c2='Otros / no sé'
+    return group,c1,c2
+
 
 def secure_s3_upload_url(host, bucket):
     """Acepta URLs HTTPS S3 firmadas, incluso si el API omite el esquema.
@@ -406,35 +523,77 @@ with st.expander('Revisar los hallazgos abiertos de otros departamentos'):
 
 st.subheader('3 · Selecciona qué solicitudes crear')
 choices=['Solo abiertas de Mantenimiento (recomendado)','Todas las abiertas (revisión necesaria)','Mostrar todo el histórico']
-mode=st.radio('Vista',choices,index=0,horizontal=False)
-if mode==choices[0]:view=df[df.seleccion].copy()
-elif mode==choices[1]:view=df[df.estado.map(norm).isin(('abierta','abierto','pendiente'))].copy()
+view_mode=st.radio('Vista',choices,index=0)
+if view_mode==choices[0]:view=df[df.seleccion].copy()
+elif view_mode==choices[1]:view=df[df.estado.map(norm).isin(('abierta','abierto','pendiente'))].copy()
 else:view=df.copy()
-# Selección masiva: restablece el editor al cambiar de vista o al pulsar los botones.
-# La clave de revisión evita que Streamlit conserve marcas antiguas del data_editor.
-selection_scope=f'{hashlib.sha256(blob).hexdigest()[:16]}_{choices.index(mode)}'
+
+# Fechas de detección del Excel: filtros inclusivos y claros, sin afectar el histórico.
+dates=pd.to_datetime(df['fecha'],errors='coerce')
+min_day=dates.min().date();max_day=dates.max().date()
+excel_key=hashlib.sha256(blob+plant_code.encode()).hexdigest()[:12]
+filter_dates=st.checkbox('Filtrar por fecha de detección',value=False,key='quality_use_date_filter_'+excel_key)
+filter_start=min_day;filter_end=max_day
+if filter_dates:
+    fa,fb=st.columns(2)
+    with fa: filter_start=st.date_input('Desde (incluido)',value=min_day,min_value=min_day,max_value=max_day,key='quality_start_date_'+excel_key)
+    with fb: filter_end=st.date_input('Hasta (incluido)',value=max_day,min_value=min_day,max_value=max_day,key='quality_end_date_'+excel_key)
+    if filter_start>filter_end:
+        st.error('La fecha inicial no puede ser posterior a la final.');st.stop()
+    view=view[(view['fecha']>=filter_start.isoformat()) & (view['fecha']<=filter_end.isoformat())]
+st.caption(f'Incidencias visibles tras los filtros: {len(view)}. Las fechas se aplican a la detección, no al cierre.')
+if view.empty:
+    st.warning('No hay incidencias con esos filtros. Amplía las fechas o modifica la vista.');st.stop()
+
+# Reinicia exclusivamente cuando cambia el archivo, la planta o el conjunto visible.
+selection_scope=hashlib.sha256((hashlib.sha256(blob).hexdigest()+plant_code+view_mode+
+    ','.join(view['referencia'].tolist())).encode()).hexdigest()[:20]
 if st.session_state.get('quality_selection_scope')!=selection_scope:
     st.session_state['quality_selection_scope']=selection_scope
     st.session_state['quality_selection_revision']=0
     st.session_state['quality_selection_override']=None
 left,right=st.columns(2)
-with left:
-    mark_all=st.button('☑️ Marcar todas las visibles',use_container_width=True,key='quality_mark_all')
-with right:
-    unmark_all=st.button('⬜ Desmarcar todas las visibles',use_container_width=True,key='quality_unmark_all')
+with left: mark_all=st.button('☑️ Marcar todas las visibles',use_container_width=True,key='quality_mark_all')
+with right: unmark_all=st.button('⬜ Desmarcar todas las visibles',use_container_width=True,key='quality_unmark_all')
 if mark_all or unmark_all:
     st.session_state['quality_selection_override']=bool(mark_all)
     st.session_state['quality_selection_revision']+=1
 if st.session_state['quality_selection_override'] is not None:
     view['seleccion']=st.session_state['quality_selection_override']
-st.caption('Estos botones afectan solo a la vista actual. Después puedes marcar o desmarcar incidencias individualmente.')
+st.caption('Estos botones afectan solo al resultado del filtro. Puedes ajustar cada incidencia individualmente.')
 cols=['seleccion','fila_excel','fecha','zona','incidencia','responsable','estado','referencia']
 editor_key=f"quality_editor_{selection_scope}_{st.session_state['quality_selection_revision']}"
-edited=st.data_editor(view[cols],hide_index=True,use_container_width=True,num_rows='fixed',key=editor_key,disabled=[c for c in cols if c!='seleccion'],column_config={'seleccion':st.column_config.CheckboxColumn('Importar'), 'incidencia':st.column_config.TextColumn('Hallazgo',width='large'),'zona':st.column_config.TextColumn('Zona',width='medium')})
+edited=st.data_editor(view[cols],hide_index=True,use_container_width=True,num_rows='fixed',key=editor_key,
+    disabled=[c for c in cols if c!='seleccion'],column_config={
+        'seleccion':st.column_config.CheckboxColumn('Importar'),
+        'incidencia':st.column_config.TextColumn('Hallazgo',width='large'),
+        'zona':st.column_config.TextColumn('Zona',width='medium')})
 selected_refs=set(edited.loc[edited['seleccion']==True,'referencia'].tolist())
 selected=df[df.referencia.isin(selected_refs)].copy()
-st.caption(f'Seleccionadas para revisión: {len(selected)}. Cada hallazgo conservará una referencia estable para evitar duplicados.')
+st.caption(f'Seleccionadas para revisión: {len(selected)}. Las ya existentes se excluirán tras consultar Fracttal.')
 if selected.empty:st.stop()
+
+st.subheader('3A · Grupo y clasificaciones propuestas por incidencia')
+st.caption('Propuesta automática por palabras del hallazgo y la zona. Revisa cada fila, especialmente «Otros / no sé». Puedes cambiar Grupo, C1 y C2 de forma independiente.')
+classification_rows=[]
+for _,rec in selected.iterrows():
+    gr,c1,c2=suggest_classification(rec)
+    classification_rows.append({'referencia':rec['referencia'],'fecha':rec['fecha'],
+        'incidencia':rec['incidencia'],'Grupo':gr,'C1':c1,'C2':c2})
+class_df=pd.DataFrame(classification_rows)
+class_fingerprint=hashlib.sha256((hashlib.sha256(blob).hexdigest()+plant_code+
+    ','.join(class_df['referencia'].tolist())).encode()).hexdigest()[:18]
+classes_edited=st.data_editor(class_df,hide_index=True,use_container_width=True,num_rows='fixed',
+    key='quality_classes_'+class_fingerprint,disabled=['referencia','fecha','incidencia'],
+    column_config={'incidencia':st.column_config.TextColumn('Hallazgo',width='large'),
+    'Grupo':st.column_config.SelectboxColumn('Grupo',options=GROUP_OPTIONS,required=True),
+    'C1':st.column_config.SelectboxColumn('Clasificación 1',options=CAT1_OPTIONS,required=True),
+    'C2':st.column_config.SelectboxColumn('Clasificación 2',options=CAT2_OPTIONS,required=True)})
+class_by_ref={str(r.referencia):(r.Grupo,r.C1,r.C2) for r in classes_edited.itertuples()}
+if len(class_by_ref)!=len(selected) or any(any(v not in opts for v,opts in zip(vals,(GROUP_OPTIONS,CAT1_OPTIONS,CAT2_OPTIONS))) for vals in class_by_ref.values()):
+    st.error('Hay clasificaciones incompletas o no válidas.');st.stop()
+unknown=sum(v[2]=='Otros / no sé' for v in class_by_ref.values())
+if unknown:st.warning(f'{unknown} incidencia(s) tienen C2 «Otros / no sé». Revisa si corresponde una opción más concreta.')
 
 st.subheader('3B · Fotografías de las incidencias')
 photo_zip=st.file_uploader('Opción A · ZIP con fotografías de Calidad',type=['zip'],key='photos_zip')
@@ -458,18 +617,18 @@ try:
             name=f'Galeria/{i:03d}_{os.path.basename(f.name)}'
             images[name]=content
     if images:
-        st.caption(f'{len(images)} fotografías encontradas. Selecciona la referencia de cada una; ninguna se envía sin asignar.')
+        st.caption(f'{len(images)} fotografías encontradas. Las coincidencias claras se asignan automáticamente. Revisa y corrige las demás antes de enviar.')
         mapping=match_photos(images,df)
         options=['(Sin asignar)']+df['referencia'].tolist()
         fingerprint=hashlib.sha256(blob)
         for name,content in images.items():
             fingerprint.update(name.encode('utf-8'));fingerprint.update(hashlib.sha256(content).digest())
         editor_key='photo_map_'+fingerprint.hexdigest()[:14]
-        mapping=st.data_editor(mapping,key=editor_key,hide_index=True,use_container_width=True,num_rows='fixed',disabled=['fotografia'],column_config={'referencia':st.column_config.SelectboxColumn('Incidencia / referencia',options=options,required=True),'fotografia':st.column_config.TextColumn('Archivo',width='large')})
+        mapping=st.data_editor(mapping,key=editor_key,hide_index=True,use_container_width=True,num_rows='fixed',disabled=['fotografia','coincidencia'],column_config={'referencia':st.column_config.SelectboxColumn('Incidencia / referencia',options=options,required=True),'fotografia':st.column_config.TextColumn('Archivo',width='large'),'coincidencia':st.column_config.TextColumn('Motivo de asociación',width='medium')})
         for r in mapping.itertuples():
             if r.referencia!='(Sin asignar)': photo_map.setdefault(r.referencia,[]).append(r.fotografia)
         linked=sum(len(v) for v in photo_map.values())
-        st.info(f'Fotografías vinculadas: {linked} de {len(images)}. Sin vincular: {len(images)-linked}.')
+        st.info(f'Fotografías vinculadas: {linked} de {len(images)}. Sin vincular: {len(images)-linked}. Las fotos sin referencia segura requieren asignación manual.')
         with st.expander('Vista previa de fotografías asociadas',expanded=bool(gallery_files)):
             for r in mapping.itertuples():
                 if r.referencia!='(Sin asignar)':
@@ -517,13 +676,7 @@ else:
     st.warning('No es posible confirmar previamente desde este formulario si el código tiene una cuenta activa. Realiza una sola solicitud de prueba.')
 requested_by=st.text_input('Solicitante (texto que aparecerá en la solicitud)',value='Departamento de Calidad – Europlátano')
 urgency=st.selectbox('Urgencia por defecto', ['No urgente (recomendado)','Urgente (solo si procede)'])
-st.caption('Cada solicitud se asociará al activo provisional de la planta. El grupo y las clasificaciones deben coincidir con los catálogos existentes en Fracttal.')
-group=st.selectbox('Grupo Fracttal', ['Calidad / Ajuste / Especificación','Incidencia (sin paro)','Mejora / Solicitud (no avería)','Seguridad / Riesgo / Medioambiente','Avería (con paro)'],index=0)
-cat1_options=['Infraestructura y edificio','Aire comprimido y neumática','Automatización y control (PLC, HMI, variadores, sensores)','Electricidad potencia (cuadros, protecciones, motores)','Envasado / embolsado / sellado','Etiquetado / impresión','Frío industrial (cámaras/túnel)','Hidráulica / bombeo / fluidos','Lavado / agua de proceso / drenajes','Paletizado / flejado','Pesaje / control / detección','Transportadores y movimiento','Vehículos de transporte (carretera / recogida)','Vehículos industriales (carretillas, transpaletas, etc.)']
-cat2_options=['Otros / no sé','Alarma / error','Atasco / bloqueo','Está roto','Falta elemento/ inexistente','Falta nivel / falta presión / falta suministro','Funciona pero mal','Hace ruido anormal','Huele mal / quemado / humo','No funciona / no arranca','Pierde líquido / fuga','Roto / partido','Se calienta','Se para / falla a ratos','Suelto / desajustado','Vibra']
-category1=st.selectbox('Clasificación 1 (catálogo de Fracttal)',cat1_options)
-category2=st.selectbox('Clasificación 2 (catálogo de Fracttal)',cat2_options)
-st.warning('Revisa las clasificaciones antes de importar: estos valores se aplican a todas las incidencias seleccionadas. Para distintas clases, haz importaciones separadas.')
+st.caption('Cada solicitud se asociará al activo provisional de su planta. Grupo, C1 y C2 son los seleccionados por incidencia en el apartado 3A.')
 st.info('El código ARM se ha confirmado como recurso humano y cuenta habilitada en Fracttal. Esto no garantiza que la API acepte todos los campos de la petición.')
 if not user_code.strip() or not requested_by.strip(): st.warning('Selecciona o introduce un código de usuario y completa el solicitante para continuar.');st.stop()
 
@@ -585,7 +738,8 @@ else:
 if new.empty:
     st.success('No hay nuevas solicitudes que crear. Puedes recuperar sus fotografías en el apartado 5B.');st.stop()
 with st.expander('Diagnóstico de la petición POST (sin datos personales ni texto del hallazgo)'):
-    sample=body_of(new.iloc[0],user_code.strip(),requested_by.strip(),urgency.startswith('Urgente'),plant_name,asset_code,group,category1,category2)
+    g,c1,c2=class_by_ref[str(new.iloc[0]['referencia'])]
+    sample=body_of(new.iloc[0],user_code.strip(),requested_by.strip(),urgency.startswith('Urgente'),plant_name,asset_code,g,c1,c2)
     st.write('Endpoint: POST /work_requests/')
     st.write('Campos enviados:', ', '.join(sorted(sample.keys())))
     st.write('user_code:', sample['user_code'])
@@ -596,20 +750,21 @@ with st.expander('Diagnóstico de la petición POST (sin datos personales ni tex
     st.write('Clasificación 2:', sample['types_2_description'])
     st.caption('No se muestran observaciones, descripción ni credenciales. El código 404 de Fracttal no demuestra por sí solo qué campo es inválido.')
 with st.expander('Vista previa: datos que se enviarán a Fracttal'):
-    st.dataframe(new[['referencia','fecha','zona','incidencia','accion_calidad']],hide_index=True,use_container_width=True)
+    preview=new[['referencia','fecha','zona','incidencia','accion_calidad']].copy()
+    preview[['Grupo','C1','C2']]=preview['referencia'].apply(lambda ref:pd.Series(class_by_ref[ref]))
+    st.dataframe(preview,hide_index=True,use_container_width=True)
 
 st.subheader('6 · Crear solicitudes')
-st.warning('Esta acción CREA solicitudes REALES. Haz primero una prueba con fotografía y comprueba el resultado en Fracttal.')
+st.warning('Esta acción CREA solicitudes REALES. Se comprueban duplicados antes del envío y se detiene el lote ante el primer error. Revisa las fotos y clasificaciones.')
 run_mode=st.radio('Alcance de la importación',['Una sola solicitud de prueba','Todas las seleccionadas que falten'],horizontal=False)
-if mode=='Introducir código de usuario manualmente' and run_mode!='Una sola solicitud de prueba':
-    st.error('Con un código introducido manualmente, primero realiza una única solicitud de prueba.');st.stop()
-if run_mode!='Una sola solicitud de prueba':
-    st.error('Importación masiva deshabilitada temporalmente hasta confirmar también los adjuntos con Fracttal.');st.stop()
 if run_mode=='Una sola solicitud de prueba':
     opts=[f"Fila {int(r.fila_excel)} · {str(r.zona)[:35]} · {str(r.incidencia)[:85]}" for r in new.itertuples()]
     chosen=st.selectbox('Incidencia de prueba',opts)
     target=new.iloc[[opts.index(chosen)]]
-else:target=new
+else:
+    if len(new)>25:
+        st.error('Por seguridad, importa como máximo 25 solicitudes por lote. Reduce las fechas o la selección.');st.stop()
+    target=new
 missing_photos=[r['referencia'] for _,r in target.iterrows() if not photo_map.get(r['referencia'])]
 if missing_photos:
     st.error(f'Hay {len(missing_photos)} incidencia(s) sin fotografía asignada. Para garantizar evidencias, asigna al menos una fotografía a cada solicitud antes de crearla.');st.stop()
@@ -628,7 +783,7 @@ if st.button('🚀 Crear solicitudes seleccionadas',type='primary',disabled=not 
                 results.append({'referencia':ref,'resultado':'Omitida: ya existe','detalle':''})
             else:
                 try:
-                    response=request('POST','/work_requests/',tk,payload=body_of(row,user_code.strip(),requested_by.strip(),urgency.startswith('Urgente'),plant_name,asset_code,group,category1,category2))
+                    response=request('POST','/work_requests/',tk,payload=body_of(row,user_code.strip(),requested_by.strip(),urgency.startswith('Urgente'),plant_name,asset_code,*class_by_ref[ref]))
                     confirmed_remote=bool(isinstance(response,dict) and response.get('success') is True and response.get('data'))
                     if not confirmed_remote:
                         results.append({'referencia':ref,'resultado':'Respuesta sin confirmación','detalle':'Comprobar en Fracttal'})
@@ -659,5 +814,5 @@ if st.button('🚀 Crear solicitudes seleccionadas',type='primary',disabled=not 
             st.session_state.pop('audit_check',None)
     except Exception as e:st.error(str(e))
 
-st.caption('Versión 2.3 · Fotografías obligatorias dentro del importador, sin exigirlas en la configuración global de Fracttal. Permite recuperar fotografías de solicitudes ya creadas.')
+st.caption('Versión 2.4 · Fechas inclusivas, fotos asociadas por coincidencias fiables y Grupo/C1/C2 independientes por incidencia. Recuperación de fotografías existentes.')
 st.caption('Las fotografías solo se transfieren al confirmar la creación. Si falla un adjunto, la solicitud ya creada NO se repite. Fuente: Excel del Departamento de Calidad. API oficial: https://api.fracttal.com/es/reference/crear-una-nueva-solicitud')
