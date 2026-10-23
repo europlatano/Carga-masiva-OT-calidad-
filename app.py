@@ -12,10 +12,10 @@ import streamlit as st
 
 API = 'https://app.fracttal.com/api'
 TOKEN_URL = 'https://one.fracttal.com/oauth/token'
-APP_VER = '1.9'
+APP_VER = '2.0'
 st.set_page_config(page_title='Calidad → Fracttal | Europlátano', page_icon='📋', layout='wide')
 st.title('📋 Auditorías de Calidad → Solicitudes Fracttal')
-st.caption(f'Europlátano · V{APP_VER} · Diagnóstico HTTP · IFS / GLOBALG.A.P. · No crea órdenes de trabajo')
+st.caption(f'Europlátano · V{APP_VER} · Diagnóstico de petición · IFS / GLOBALG.A.P. · No crea órdenes de trabajo')
 
 def sec(k):
     try: return str(st.secrets.get(k,'')).strip()
@@ -87,9 +87,9 @@ def oauth():
 def _safe_api_error(body):
     """Muestra detalles de validación sin volcar tokens ni cuerpos de solicitudes."""
     if not isinstance(body,dict):
-        return 'Fracttal no devolvió un error JSON interpretable.'
+        return str(body)[:1000] if body else 'Fracttal no devolvió un error JSON interpretable.'
     parts=[]
-    for key in ('message','error','error_description','detail','errors'):
+    for key in ('message','error','error_description','detail','errors','data'):
         value=body.get(key)
         if not value: continue
         if isinstance(value,dict):
@@ -98,7 +98,7 @@ def _safe_api_error(body):
         elif isinstance(value,list):
             for entry in value[:12]:
                 if isinstance(entry,dict):
-                    parts.append(f"{entry.get('field',entry.get('property','campo'))}: {entry.get('message',entry.get('error','validación incorrecta'))}")
+                    parts.append(' | '.join(f'{k}: {v}' for k,v in entry.items() if k.lower() in ('error','message','field','property','code','detail','description')) or str(entry)[:250])
                 else: parts.append(str(entry))
         else: parts.append(str(value))
     msg=' | '.join(parts) if parts else 'Sin detalle de validación en la respuesta.'
@@ -113,9 +113,10 @@ def request(method,endpoint,token,*,payload=None,params=None):
     if payload is not None: headers['Content-Type']='application/json'
     res=requests.request(method,API+endpoint,headers=headers,json=payload,params=params,timeout=40)
     try: body=res.json()
-    except ValueError: body={}
+    except ValueError: body={'detail':res.text[:500] if res.text else 'Respuesta vacía'}
     if res.status_code>=400 or (isinstance(body,dict) and body.get('success') is False):
-        raise RuntimeError(f'{method} {endpoint}: HTTP {res.status_code}. {_safe_api_error(body)}')
+        sent_fields=', '.join(sorted(payload.keys())) if isinstance(payload,dict) else '(sin JSON)'
+        raise RuntimeError(f'{method} {endpoint}: HTTP {res.status_code}. {_safe_api_error(body)} | Campos enviados: {sent_fields}')
     return body
 
 def fetch_paged(token, endpoint):
@@ -444,7 +445,7 @@ if mode=='Seleccionar del listado de personal':
     else:
         st.info('Primero pulsa «Cargar / actualizar listado» o elige introducir el código manualmente.')
 else:
-    user_code=st.text_input('Código de usuario de Fracttal (user_code)',value='',
+    user_code=st.text_input('Código de usuario de Fracttal (user_code)',value='ARM',
         help='Introduce el código exacto de un usuario con cuenta en Fracttal; no el correo ni el nombre.').strip()
     st.warning('No es posible confirmar previamente desde este formulario si el código tiene una cuenta activa. Realiza una sola solicitud de prueba.')
 requested_by=st.text_input('Solicitante (texto que aparecerá en la solicitud)',value='Departamento de Calidad – Europlátano')
@@ -456,6 +457,7 @@ cat2_options=['Otros / no sé','Alarma / error','Atasco / bloqueo','Está roto',
 category1=st.selectbox('Clasificación 1 (catálogo de Fracttal)',cat1_options)
 category2=st.selectbox('Clasificación 2 (catálogo de Fracttal)',cat2_options)
 st.warning('Revisa las clasificaciones antes de importar: estos valores se aplican a todas las incidencias seleccionadas. Para distintas clases, haz importaciones separadas.')
+st.info('El código ARM se ha confirmado como recurso humano y cuenta habilitada en Fracttal. Esto no garantiza que la API acepte todos los campos de la petición.')
 if not user_code.strip() or not requested_by.strip(): st.warning('Selecciona o introduce un código de usuario y completa el solicitante para continuar.');st.stop()
 
 st.subheader('5 · Comprobar duplicados (solo lectura)')
@@ -478,14 +480,27 @@ if not duplicates.empty:
         st.dataframe(duplicates[['referencia','zona','incidencia']],hide_index=True)
 if new.empty:
     st.success('No hay nuevas solicitudes que crear.');st.stop()
+with st.expander('Diagnóstico de la petición POST (sin datos personales ni texto del hallazgo)'):
+    sample=body_of(new.iloc[0],user_code.strip(),requested_by.strip(),urgency.startswith('Urgente'),plant_name,asset_code,group,category1,category2)
+    st.write('Endpoint: POST /work_requests/')
+    st.write('Campos enviados:', ', '.join(sorted(sample.keys())))
+    st.write('user_code:', sample['user_code'])
+    st.write('user_type:', sample['user_type'])
+    st.write('code (activo):', sample['code'])
+    st.write('Grupo:', sample['types_description'])
+    st.write('Clasificación 1:', sample['types_1_description'])
+    st.write('Clasificación 2:', sample['types_2_description'])
+    st.caption('No se muestran observaciones, descripción ni credenciales. El código 404 de Fracttal no demuestra por sí solo qué campo es inválido.')
 with st.expander('Vista previa: datos que se enviarán a Fracttal'):
     st.dataframe(new[['referencia','fecha','zona','incidencia','accion_calidad']],hide_index=True,use_container_width=True)
 
 st.subheader('6 · Crear solicitudes')
-st.warning('Esta acción CREA solicitudes REALES de trabajo. Para la primera puesta en marcha, elige «Una sola solicitud de prueba».')
+st.warning('Esta acción CREA solicitudes REALES de trabajo. Hasta resolver la validación 400/404, SOLO se permite una solicitud de prueba.')
 run_mode=st.radio('Alcance de la importación',['Una sola solicitud de prueba','Todas las seleccionadas que falten'],horizontal=False)
 if mode=='Introducir código de usuario manualmente' and run_mode!='Una sola solicitud de prueba':
     st.error('Con un código introducido manualmente, primero realiza una única solicitud de prueba.');st.stop()
+if run_mode!='Una sola solicitud de prueba':
+    st.error('Importación masiva deshabilitada temporalmente hasta confirmar la creación con Fracttal.');st.stop()
 if run_mode=='Una sola solicitud de prueba':
     opts=[f"Fila {int(r.fila_excel)} · {str(r.zona)[:35]} · {str(r.incidencia)[:85]}" for r in new.itertuples()]
     chosen=st.selectbox('Incidencia de prueba',opts)
