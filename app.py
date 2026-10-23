@@ -13,10 +13,10 @@ import streamlit as st
 
 API = 'https://app.fracttal.com/api'
 TOKEN_URL = 'https://one.fracttal.com/oauth/token'
-APP_VER = '2.2'
+APP_VER = '2.3'
 st.set_page_config(page_title='Calidad → Fracttal | Europlátano', page_icon='📋', layout='wide')
 st.title('📋 Auditorías de Calidad → Solicitudes Fracttal')
-st.caption(f'Europlátano · V{APP_VER} · Corrección subida S3 · IFS / GLOBALG.A.P. · No crea órdenes de trabajo')
+st.caption(f'Europlátano · V{APP_VER} · Compatibilidad rutas S3 · IFS / GLOBALG.A.P. · No crea órdenes de trabajo')
 
 def sec(k):
     try: return str(st.secrets.get(k,'')).strip()
@@ -306,7 +306,12 @@ def secure_s3_upload_url(host, bucket):
         if parsed.path not in ('', '/'):
             raise RuntimeError('Destino S3 con ruta no esperada; revisión necesaria.')
     elif s3_path:
-        if parsed.path.rstrip('/') != '/' + bucket:
+        # Fracttal puede devolver host S3 genérico SIN el bucket en su ruta.
+        # En ese caso el POST multipart debe dirigirse a /<bucket>/ (path-style).
+        path = parsed.path.rstrip('/')
+        if path in ('', '/'):
+            raw = raw.rstrip('/') + '/' + bucket + '/'
+        elif path != '/' + bucket:
             raise RuntimeError('El bucket S3 no coincide con la ruta de subida.')
     else:
         # No se enseña la URL completa: puede contener credenciales temporales.
@@ -654,5 +659,5 @@ if st.button('🚀 Crear solicitudes seleccionadas',type='primary',disabled=not 
             st.session_state.pop('audit_check',None)
     except Exception as e:st.error(str(e))
 
-st.caption('Versión 2.2 · Fotografías obligatorias dentro del importador, sin exigirlas en la configuración global de Fracttal. Permite recuperar fotografías de solicitudes ya creadas.')
+st.caption('Versión 2.3 · Fotografías obligatorias dentro del importador, sin exigirlas en la configuración global de Fracttal. Permite recuperar fotografías de solicitudes ya creadas.')
 st.caption('Las fotografías solo se transfieren al confirmar la creación. Si falla un adjunto, la solicitud ya creada NO se repite. Fuente: Excel del Departamento de Calidad. API oficial: https://api.fracttal.com/es/reference/crear-una-nueva-solicitud')
