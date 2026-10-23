@@ -7,15 +7,16 @@ from collections import Counter
 from datetime import datetime, date, timezone
 from zoneinfo import ZoneInfo
 import requests
+from urllib.parse import urlsplit
 import pandas as pd
 import streamlit as st
 
 API = 'https://app.fracttal.com/api'
 TOKEN_URL = 'https://one.fracttal.com/oauth/token'
-APP_VER = '2.1'
+APP_VER = '2.2'
 st.set_page_config(page_title='Calidad → Fracttal | Europlátano', page_icon='📋', layout='wide')
 st.title('📋 Auditorías de Calidad → Solicitudes Fracttal')
-st.caption(f'Europlátano · V{APP_VER} · Fotografías y recuperación · IFS / GLOBALG.A.P. · No crea órdenes de trabajo')
+st.caption(f'Europlátano · V{APP_VER} · Corrección subida S3 · IFS / GLOBALG.A.P. · No crea órdenes de trabajo')
 
 def sec(k):
     try: return str(st.secrets.get(k,'')).strip()
@@ -277,17 +278,55 @@ def match_photos(images, df):
         rows.append({'fotografia':path,'referencia':hits[0] if len(hits)==1 else '(Sin asignar)'})
     return pd.DataFrame(rows)
 
+def secure_s3_upload_url(host, bucket):
+    """Acepta URLs HTTPS S3 firmadas, incluso si el API omite el esquema.
+
+    No se permite enviar fotos a destinos arbitrarios, redirecciones ni HTTP.
+    El bucket devuelto por Fracttal debe coincidir con el destino.
+    """
+    if not isinstance(host, str) or not host.strip():
+        raise RuntimeError('Fracttal no devolvió un destino de subida válido.')
+    raw = host.strip()
+    if raw.startswith('//'):
+        raw = 'https:' + raw
+    elif '://' not in raw:
+        raw = 'https://' + raw
+    parsed = urlsplit(raw)
+    domain = (parsed.hostname or '').lower().rstrip('.')
+    bucket = str(bucket or '').strip().lower()
+    if (parsed.scheme != 'https' or not domain or parsed.username or
+            parsed.password or parsed.port not in (None, 443) or
+            not bucket or not re.fullmatch(r'[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]', bucket)):
+        raise RuntimeError('Destino de subida no seguro (formato HTTPS o bucket inválido).')
+    # AWS S3: estilo de host bucket.s3.amazonaws.com, regional o accelerate.
+    # También admite endpoint path-style regional s3.<region>.amazonaws.com/<bucket>.
+    s3_virtual = re.fullmatch(r'(?:s3(?:[.-][a-z0-9-]+)*\.)amazonaws\.com(?:\.cn)?', domain[len(bucket)+1:]) if domain.startswith(bucket + '.') else None
+    s3_path = re.fullmatch(r's3(?:[.-][a-z0-9-]+)*\.amazonaws\.com(?:\.cn)?', domain)
+    if s3_virtual:
+        if parsed.path not in ('', '/'):
+            raise RuntimeError('Destino S3 con ruta no esperada; revisión necesaria.')
+    elif s3_path:
+        if parsed.path.rstrip('/') != '/' + bucket:
+            raise RuntimeError('El bucket S3 no coincide con la ruta de subida.')
+    else:
+        # No se enseña la URL completa: puede contener credenciales temporales.
+        raise RuntimeError('Host de subida no reconocido como S3 oficial. Dominio: ' + domain[:150])
+    if parsed.query or parsed.fragment:
+        raise RuntimeError('Destino S3 con parámetros inesperados; revisión necesaria.')
+    return raw
+
+
 def upload_photo(token, filename, content):
     signed=request('POST','/s3_object/',token,payload={'name':os.path.basename(filename),'size':len(content)})
     d=signed.get('data') if isinstance(signed,dict) else None
-    required=('host','key','acl','policy','credential','date','signature')
+    required=('host','key','bucket','acl','policy','credential','date','signature')
     if not isinstance(d,dict) or not all(d.get(x) for x in required):
         raise RuntimeError('Fracttal no devolvió las credenciales completas de subida.')
     fields=[('key',d['key']),('acl',d['acl']),('policy',d['policy']),('x-amz-credential',d['credential']),('x-amz-algorithm','AWS4-HMAC-SHA256'),('x-amz-date',d['date']),('x-amz-signature',d['signature']),('success_action_status','200')]
-    host=d['host']
-    if not host.startswith('https://'): raise RuntimeError('Destino de subida no seguro.')
-    res=requests.post(host,data=fields,files={'file':(os.path.basename(filename),io.BytesIO(content))},timeout=90)
-    if res.status_code not in (200,201,204): raise RuntimeError('No se pudo transferir la fotografía al almacenamiento (HTTP %s).' % res.status_code)
+    host=secure_s3_upload_url(d['host'], d['bucket'])
+    res=requests.post(host,data=fields,files={'file':(os.path.basename(filename),io.BytesIO(content))},timeout=90,allow_redirects=False)
+    if res.status_code not in (200,201,204):
+        raise RuntimeError('No se pudo transferir la fotografía a S3 (HTTP %s). No se ha vinculado.' % res.status_code)
     return d['key']
 
 def attach_photos(token, request_id, assigned, images):
@@ -615,5 +654,5 @@ if st.button('🚀 Crear solicitudes seleccionadas',type='primary',disabled=not 
             st.session_state.pop('audit_check',None)
     except Exception as e:st.error(str(e))
 
-st.caption('Versión 2.1 · Fotografías obligatorias dentro del importador, sin exigirlas en la configuración global de Fracttal. Permite recuperar fotografías de solicitudes ya creadas.')
+st.caption('Versión 2.2 · Fotografías obligatorias dentro del importador, sin exigirlas en la configuración global de Fracttal. Permite recuperar fotografías de solicitudes ya creadas.')
 st.caption('Las fotografías solo se transfieren al confirmar la creación. Si falla un adjunto, la solicitud ya creada NO se repite. Fuente: Excel del Departamento de Calidad. API oficial: https://api.fracttal.com/es/reference/crear-una-nueva-solicitud')
