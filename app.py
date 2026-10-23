@@ -12,7 +12,7 @@ import streamlit as st
 
 API = 'https://app.fracttal.com/api'
 TOKEN_URL = 'https://one.fracttal.com/oauth/token'
-APP_VER = '1.8'
+APP_VER = '1.9'
 st.set_page_config(page_title='Calidad → Fracttal | Europlátano', page_icon='📋', layout='wide')
 st.title('📋 Auditorías de Calidad → Solicitudes Fracttal')
 st.caption(f'Europlátano · V{APP_VER} · Diagnóstico HTTP · IFS / GLOBALG.A.P. · No crea órdenes de trabajo')
@@ -140,30 +140,30 @@ def fetch_paged(token, endpoint):
     raise RuntimeError('Límite de paginación superado en '+endpoint)
 
 def available_requesters(token):
-    """Solo cuentas activas vinculadas inequívocamente a recursos humanos activos."""
-    accounts=fetch_paged(token,'/accounts/')
-    personnel=fetch_paged(token,'/personnel/')
-    by_email={}
-    for person in personnel:
-        if not isinstance(person,dict) or person.get('active') is False: continue
-        email=str(person.get('account_email') or person.get('email') or '').strip().casefold()
-        if email: by_email.setdefault(email,[]).append(person)
-    found=[]; codes=set()
-    for account in accounts:
-        if not isinstance(account,dict) or account.get('active') is not True: continue
-        if account.get('type_user',account.get('user_type'))!='HUMAN_RESOURCES': continue
-        email=str(account.get('email') or '').strip().casefold()
-        matches=by_email.get(email,[]) if email else []
-        # No deducir códigos de nombres: podrían existir homónimos.
-        matches=[p for p in matches if p.get('account_active') is not False and str(p.get('code') or '').strip()]
-        if len(matches)!=1: continue
-        person=matches[0]
-        code=str(person['code']).strip()
-        if code in codes: continue
-        codes.add(code)
-        found.append({'nombre':str(account.get('name') or person.get('full_name') or code),
-                      'codigo':code,'email':email})
-    return sorted(found,key=lambda u:(norm(u['nombre']),u['codigo'])),len(accounts)
+    """Lista códigos reales de personal sin depender de /accounts/.
+
+    El catálogo de personal no demuestra que exista una cuenta de acceso.
+    Fracttal validará el user_code al crear una única solicitud de prueba.
+    """
+    endpoints=('/personnel/','/human_resources/')
+    errors=[]
+    for endpoint in endpoints:
+        try:
+            personnel=fetch_paged(token,endpoint)
+        except Exception as exc:
+            errors.append(f'{endpoint}: {str(exc)[:180]}')
+            continue
+        found=[];codes=set()
+        for person in personnel:
+            if not isinstance(person,dict) or person.get('active') is False:
+                continue
+            code=str(person.get('code') or person.get('code_personnel') or '').strip()
+            if not code or code in codes: continue
+            codes.add(code)
+            name=str(person.get('full_name') or person.get('name') or ' '.join(filter(None,[str(person.get('first_name') or '').strip(),str(person.get('last_name') or '').strip()])) or code).strip()
+            found.append({'nombre':name,'codigo':code})
+        return sorted(found,key=lambda u:(norm(u['nombre']),u['codigo'])),endpoint
+    raise RuntimeError('No se ha podido consultar el catálogo de personal. '+' | '.join(errors))
 
 def fetch_all(token):
     """Recorre todas las páginas usando start/limit oficiales de Fracttal.
@@ -417,36 +417,46 @@ except Exception as exc:
 if photo_error: st.stop()
 
 st.subheader('4 · Configuración de Fracttal')
-st.caption('Selecciona un usuario con cuenta activa de Fracttal. La aplicación consulta las cuentas y sus códigos reales; no crea usuarios.')
-if st.button('👥 Cargar / actualizar listado de usuarios de Fracttal',key='load_requesters'):
+st.caption('Consulta el personal de Fracttal para seleccionar su código, o introdúcelo manualmente si la API no permite listar personal. El catálogo no garantiza que la persona tenga cuenta activa.')
+if st.button('👥 Cargar / actualizar listado de personal de Fracttal',key='load_requesters'):
     try:
-        people,account_total=available_requesters(oauth())
+        people,source=available_requesters(oauth())
         st.session_state['quality_requesters']=people
-        st.session_state['quality_accounts_total']=account_total
+        st.session_state['quality_requesters_source']=source
         if not people:
-            st.warning('No se pudieron vincular cuentas activas con recursos humanos por correo. Comprueba los correos de las cuentas y recursos humanos en Fracttal.')
+            st.warning('El catálogo no devuelve personas con código. Puedes introducir un código manualmente.')
+        else:
+            st.success(f'Se han cargado {len(people)} personas desde {source}.')
     except Exception as exc:
         st.session_state.pop('quality_requesters',None)
-        st.error('No se pudo consultar el listado: '+str(exc))
+        st.warning('No se pudo consultar el listado. Puedes usar el código manual. Detalle: '+str(exc))
 people=st.session_state.get('quality_requesters',[])
-if not people:
-    st.info('Pulsa «Cargar / actualizar listado» para elegir el solicitante. La creación queda bloqueada hasta seleccionar una cuenta válida.')
-    st.stop()
-st.caption(f'Usuarios seleccionables: {len(people)}. Cuentas consultadas: {st.session_state.get("quality_accounts_total",0)}.')
-selected_person=st.selectbox('Usuario de Fracttal que registrará las solicitudes',
-    range(len(people)),format_func=lambda i:f"{people[i]['nombre']} · {people[i]['codigo']} · {people[i]['email']}")
-user_code=people[selected_person]['codigo']
-st.success(f'Código de usuario seleccionado: {user_code}')
+mode=st.radio('Cómo elegir el solicitante',
+    ['Seleccionar del listado de personal','Introducir código de usuario manualmente'],
+    index=0 if people else 1,key='quality_requester_mode')
+user_code=''
+if mode=='Seleccionar del listado de personal':
+    if people:
+        selected_person=st.selectbox('Persona solicitante en Fracttal',
+            range(len(people)),format_func=lambda i:f"{people[i]['nombre']} · {people[i]['codigo']}")
+        user_code=people[selected_person]['codigo']
+        st.caption('Código seleccionado: '+user_code+' · La existencia de una cuenta activa se validará al crear la solicitud.')
+    else:
+        st.info('Primero pulsa «Cargar / actualizar listado» o elige introducir el código manualmente.')
+else:
+    user_code=st.text_input('Código de usuario de Fracttal (user_code)',value='',
+        help='Introduce el código exacto de un usuario con cuenta en Fracttal; no el correo ni el nombre.').strip()
+    st.warning('No es posible confirmar previamente desde este formulario si el código tiene una cuenta activa. Realiza una sola solicitud de prueba.')
 requested_by=st.text_input('Solicitante (texto que aparecerá en la solicitud)',value='Departamento de Calidad – Europlátano')
 urgency=st.selectbox('Urgencia por defecto', ['No urgente (recomendado)','Urgente (solo si procede)'])
 st.caption('Cada solicitud se asociará al activo provisional de la planta. El grupo y las clasificaciones deben coincidir con los catálogos existentes en Fracttal.')
 group=st.selectbox('Grupo Fracttal', ['Calidad / Ajuste / Especificación','Incidencia (sin paro)','Mejora / Solicitud (no avería)','Seguridad / Riesgo / Medioambiente','Avería (con paro)'],index=0)
-cat1_options=['Infraestructura y edificio','Aire comprimido y neumática','Automatización y control (PLC, HMI, variadores, sensores','Electricidad potencia (cuadros, protecciones, motores)','Envasado / embolsado / sellado','Etiquetado / impresión','Frío industrial (cámaras/túnel)','Hidráulica / bombeo / fluidos','Lavado / agua de proceso / drenajes','Paletizado / flejado','Pesaje / control / detección','Transportadores y movimiento','Vehículos de transporte (carretera / recogida)','Vehículos industriales (carretillas, transpaletas, etc.)']
+cat1_options=['Infraestructura y edificio','Aire comprimido y neumática','Automatización y control (PLC, HMI, variadores, sensores)','Electricidad potencia (cuadros, protecciones, motores)','Envasado / embolsado / sellado','Etiquetado / impresión','Frío industrial (cámaras/túnel)','Hidráulica / bombeo / fluidos','Lavado / agua de proceso / drenajes','Paletizado / flejado','Pesaje / control / detección','Transportadores y movimiento','Vehículos de transporte (carretera / recogida)','Vehículos industriales (carretillas, transpaletas, etc.)']
 cat2_options=['Otros / no sé','Alarma / error','Atasco / bloqueo','Está roto','Falta elemento/ inexistente','Falta nivel / falta presión / falta suministro','Funciona pero mal','Hace ruido anormal','Huele mal / quemado / humo','No funciona / no arranca','Pierde líquido / fuga','Roto / partido','Se calienta','Se para / falla a ratos','Suelto / desajustado','Vibra']
 category1=st.selectbox('Clasificación 1 (catálogo de Fracttal)',cat1_options)
 category2=st.selectbox('Clasificación 2 (catálogo de Fracttal)',cat2_options)
 st.warning('Revisa las clasificaciones antes de importar: estos valores se aplican a todas las incidencias seleccionadas. Para distintas clases, haz importaciones separadas.')
-if not user_code.strip() or not requested_by.strip(): st.warning('Completa el código de usuario y el solicitante para continuar.');st.stop()
+if not user_code.strip() or not requested_by.strip(): st.warning('Selecciona o introduce un código de usuario y completa el solicitante para continuar.');st.stop()
 
 st.subheader('5 · Comprobar duplicados (solo lectura)')
 filetag=hashlib.sha256(blob+plant_code.encode()).hexdigest()[:12]
@@ -474,6 +484,8 @@ with st.expander('Vista previa: datos que se enviarán a Fracttal'):
 st.subheader('6 · Crear solicitudes')
 st.warning('Esta acción CREA solicitudes REALES de trabajo. Para la primera puesta en marcha, elige «Una sola solicitud de prueba».')
 run_mode=st.radio('Alcance de la importación',['Una sola solicitud de prueba','Todas las seleccionadas que falten'],horizontal=False)
+if mode=='Introducir código de usuario manualmente' and run_mode!='Una sola solicitud de prueba':
+    st.error('Con un código introducido manualmente, primero realiza una única solicitud de prueba.');st.stop()
 if run_mode=='Una sola solicitud de prueba':
     opts=[f"Fila {int(r.fila_excel)} · {str(r.zona)[:35]} · {str(r.incidencia)[:85]}" for r in new.itertuples()]
     chosen=st.selectbox('Incidencia de prueba',opts)
@@ -525,5 +537,5 @@ if st.button('🚀 Crear solicitudes seleccionadas',type='primary',disabled=not 
             st.session_state.pop('audit_check',None)
     except Exception as e:st.error(str(e))
 
-st.caption('Versión 1.8 · Selector de usuarios con cuenta activa · Diagnóstico de errores HTTP: muestra los campos rechazados por Fracttal cuando la API facilita detalles. No muestra contraseñas ni tokens.')
+st.caption('Versión 1.9 · Catálogo de personal y código manual · La cuenta del solicitante se valida en Fracttal al crear la solicitud de prueba. No muestra contraseñas ni tokens.')
 st.caption('Las fotografías solo se transfieren al confirmar la creación. Si falla un adjunto, la solicitud ya creada NO se repite. Fuente: Excel del Departamento de Calidad. API oficial: https://api.fracttal.com/es/reference/crear-una-nueva-solicitud')
