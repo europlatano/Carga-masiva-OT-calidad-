@@ -13,7 +13,7 @@ import streamlit as st
 
 API = 'https://app.fracttal.com/api'
 TOKEN_URL = 'https://one.fracttal.com/oauth/token'
-APP_VER = '2.6'
+APP_VER = '2.7'
 st.set_page_config(page_title='Calidad → Fracttal | Europlátano', page_icon='📋', layout='wide')
 st.title('📋 Auditorías de Calidad → Solicitudes Fracttal')
 st.caption(f'Europlátano · V{APP_VER} · Solicitante automático por incidencia · fotos recuperables · fechas · clasificación · IFS / GLOBALG.A.P. · No crea órdenes de trabajo')
@@ -826,26 +826,87 @@ for row in duplicates.itertuples():
         recoverable.append({'referencia':row.referencia,'id_code':item.get('id_code'),
                             'fotografias':len(photos),'archivos':photos})
 if recoverable:
-    recovery_options=[f"{r['referencia']} · Solicitud {r['id_code']} · {r['fotografias']} foto(s)" for r in recoverable]
-    recovery_choice=st.selectbox('Solicitud existente a la que adjuntar fotografías',recovery_options)
-    recovery=recoverable[recovery_options.index(recovery_choice)]
-    st.warning('Antes de continuar, abre esta solicitud en Fracttal y comprueba que las fotos no estén ya adjuntas. Esta opción no elimina adjuntos previos.')
-    recovery_confirm=st.checkbox('He comprobado que estas fotografías todavía NO están adjuntas',key='confirm_recovery')
-    if st.button('📎 Adjuntar fotografías a esta solicitud existente',disabled=not recovery_confirm):
+    st.info(f'{len(recoverable)} solicitudes existentes con fotografías asignadas; '
+            f'{sum(r["fotografias"] for r in recoverable)} fotografías en total.')
+    recovery_table=pd.DataFrame([{
+        'Procesar':False,'Referencia':r['referencia'],
+        'Solicitud Fracttal':str(r['id_code']), 'Fotografías':r['fotografias'],
+        'Archivos':', '.join(os.path.basename(f) for f in r['archivos'])
+    } for r in recoverable])
+    recovery_scope=hashlib.sha256((editor_key + '|' + '|'.join(
+        f"{r['referencia']}:{r['id_code']}:{','.join(r['archivos'])}" for r in recoverable
+    )).encode()).hexdigest()[:16]
+    recovery_all=st.checkbox('Seleccionar todas las solicitudes existentes con fotos',
+                             value=False,key='batch_all_'+recovery_scope)
+    if recovery_all: recovery_table['Procesar']=True
+    recovery_edited=st.data_editor(recovery_table,hide_index=True,use_container_width=True,
+        key='batch_editor_'+recovery_scope+'_'+str(recovery_all),num_rows='fixed',
+        disabled=['Referencia','Solicitud Fracttal','Fotografías','Archivos'])
+    to_recover=[r for r,flag in zip(recoverable,recovery_edited['Procesar']) if flag]
+    st.caption(f'Lote seleccionado: {len(to_recover)} solicitudes / '
+               f'{sum(r["fotografias"] for r in to_recover)} fotografías.')
+    st.warning('La API utilizada no permite confirmar aquí si un archivo idéntico ya '
+               'estaba adjunto. Antes de ejecutar, comprueba en Fracttal que las fotos '
+               'seleccionadas no estén cargadas. Si hay un error, NO reintentes '
+               'sin comprobar el estado remoto.')
+    recovery_confirm=st.checkbox('He comprobado en Fracttal que las fotografías del lote '
+        'seleccionado todavía NO están adjuntas',key='confirm_batch_recovery_'+recovery_scope)
+    recovery_phrase=st.text_input('Para autorizar el lote, escribe ADJUNTAR FOTOS',
+                                  key='phrase_batch_recovery_'+recovery_scope)
+    ready=bool(to_recover) and recovery_confirm and recovery_phrase.strip()=='ADJUNTAR FOTOS'
+    if st.button('📎 Adjuntar fotos a las solicitudes existentes seleccionadas',
+                 type='primary',disabled=not ready):
+        report=[]
         try:
             tk=oauth()
-            # Confirmar que sigue existiendo y que su referencia coincide con la elegida.
+            # Lectura reciente, completa, para no usar identificadores de una sesión antigua.
             _,_,fresh_items=fetch_all(tk,with_items=True)
-            matching=[x for x in fresh_items if request_reference(x)==recovery['referencia'] and str(x.get('id_code'))==str(recovery['id_code'])]
-            if len(matching)!=1:
-                raise RuntimeError('No se pudo confirmar de forma única la solicitud existente. No se adjuntó nada.')
-            n=attach_photos(tk,int(recovery['id_code']),recovery['archivos'],images)
-            st.success(f'Fracttal ha confirmado {n} fotografía(s) vinculadas a la solicitud {recovery["id_code"]}.')
+            fresh_by_ref={}
+            for item in fresh_items:
+                ref=request_reference(item)
+                if ref: fresh_by_ref.setdefault(ref,[]).append(item)
+            # Validar el lote entero ANTES de comenzar la primera subida.
+            for rec in to_recover:
+                found=[i for i in fresh_by_ref.get(rec['referencia'],[])
+                       if str(i.get('id_code'))==str(rec['id_code'])]
+                if len(found)!=1 or len(fresh_by_ref.get(rec['referencia'],[]))!=1:
+                    raise RuntimeError('Referencia no única o identificador cambiado: '
+                                       +rec['referencia']+'. No se ha iniciado ninguna subida.')
+                for filepath in rec['archivos']:
+                    if filepath not in images:
+                        raise RuntimeError('Falta un archivo asignado: '+filepath)
+            bar=st.progress(0)
+            for index,rec in enumerate(to_recover,1):
+                try:
+                    n=attach_photos(tk,int(rec['id_code']),rec['archivos'],images)
+                    report.append({'Referencia':rec['referencia'],
+                                   'Solicitud Fracttal':rec['id_code'],
+                                   'Previstas':len(rec['archivos']),'Confirmadas':n,
+                                   'Estado':'Confirmado','Detalle':''})
+                except Exception as exc:
+                    report.append({'Referencia':rec['referencia'],
+                                   'Solicitud Fracttal':rec['id_code'],
+                                   'Previstas':len(rec['archivos']),'Confirmadas':'Sin verificar',
+                                   'Estado':'Revisión manual obligatoria',
+                                   'Detalle':str(exc)[:500]})
+                    st.error('El lote se ha detenido en '+rec['referencia']+
+                             '. Comprueba los adjuntos en Fracttal antes de reintentar.')
+                    break
+                bar.progress(index/len(to_recover))
+            if report:
+                result_df=pd.DataFrame(report)
+                st.dataframe(result_df,hide_index=True,use_container_width=True)
+                st.download_button('Descargar informe de adjuntos (CSV)',
+                    data=result_df.to_csv(index=False).encode('utf-8-sig'),
+                    file_name='resultado_adjuntos_solicitudes_existentes.csv',mime='text/csv')
+                if all(r['Estado']=='Confirmado' for r in report) and len(report)==len(to_recover):
+                    st.success(f'Finalizado: {len(report)} solicitudes y '
+                               f'{sum(r["Confirmadas"] for r in report)} fotografías confirmadas.')
         except Exception as exc:
-            st.error('No se confirmó la vinculación: '+str(exc))
-            st.warning('No repitas el envío hasta comprobar en Fracttal si las fotos aparecen.')
+            st.error('No se pudo iniciar el lote de adjuntos: '+str(exc))
 else:
-    st.info('No hay solicitudes ya existentes con fotografías vinculadas en esta carga. Selecciona una incidencia creada y asígnale sus fotos en el apartado 3B.')
+    st.info('No hay solicitudes ya existentes con fotografías vinculadas en esta carga. '
+            'Selecciona una incidencia creada y asígnale sus fotos en el apartado 3B.')
 
 if new.empty:
     st.success('No hay nuevas solicitudes que crear. Puedes recuperar sus fotografías en el apartado 5B.');st.stop()
@@ -932,5 +993,5 @@ if st.button('🚀 Crear solicitudes seleccionadas',type='primary',disabled=not 
             st.session_state.pop('audit_check',None)
     except Exception as e:st.error(str(e))
 
-st.caption('Versión 2.6 · Solicitante por incidencia desde Excel · Fotografías opcionales durante la creación y recuperables en 5B · Filtro de fechas y Grupo/C1/C2 individual.')
+st.caption('Versión 2.7 · Solicitante por incidencia desde Excel · Fotografías opcionales durante la creación y recuperación múltiple en 5B · Filtro de fechas y Grupo/C1/C2 individual.')
 st.caption('Puedes crear sin fotos y asociarlas después desde 5B. Si falla un adjunto, la solicitud ya creada NO se repite. Fuente: Excel del Departamento de Calidad. API oficial: https://api.fracttal.com/es/reference/crear-una-nueva-solicitud')
