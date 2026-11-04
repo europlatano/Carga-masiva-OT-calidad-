@@ -16,7 +16,7 @@ TOKEN_URL = 'https://one.fracttal.com/oauth/token'
 APP_VER = '2.8'
 st.set_page_config(page_title='Calidad → Fracttal | Europlátano', page_icon='📋', layout='wide')
 st.title('📋 Auditorías de Calidad → Solicitudes Fracttal')
-st.caption(f'Europlátano · V{APP_VER} · Excel corporativo · Auditor automático · Nº incidencia y fotografías · IFS / GLOBALG.A.P. · No crea órdenes de trabajo')
+st.caption(f'Europlátano · V{APP_VER} · Solicitante automático por incidencia · fotos recuperables · fechas · clasificación · IFS / GLOBALG.A.P. · No crea órdenes de trabajo')
 
 def sec(k):
     try: return str(st.secrets.get(k,'')).strip()
@@ -53,26 +53,13 @@ def codigo_por_iniciales(nombre):
     return ''.join(p[0].upper() for p in partes if p not in PARTICULAS_NOMBRE)
 
 def columna_reportado_por(frame):
-    """Admite el encabezado corporativo Auditor y las plantillas anteriores."""
-    aceptadas = {'auditor', 'reportado por', 'reportada por', 'persona que reporta',
+    """Busca el encabezado de la columna opcional sin depender de su posición."""
+    aceptadas = {'reportado por', 'reportada por', 'persona que reporta',
                  'nombre y apellidos del reportante', 'solicitante calidad'}
     for col in frame.columns:
         if re.sub(r'\s+', ' ', norm(col).replace('_',' ')) in aceptadas:
             return col
     return None
-
-def columna_numero(frame):
-    for col in frame.columns:
-        if re.sub(r'\s+', ' ', norm(col).replace('_',' ')) in {
-            'n incidencia', 'no incidencia', 'num incidencia', 'numero incidencia', 'nº incidencia'}:
-            return col
-    return None
-
-def numero_incidencia(v):
-    if v is None or pd.isna(v): return ''
-    raw=str(v).strip()
-    if re.fullmatch(r'\d+(?:\.0+)?',raw): return str(int(float(raw)))
-    return raw if re.fullmatch(r'[0-9]{1,8}',raw) else ''
 
 def dtstr(v):
     if isinstance(v,(datetime,date)): return v.strftime('%Y-%m-%d')
@@ -89,50 +76,51 @@ def ident(date_val, area, incidence, occurrence, plant_code):
     seed='|'.join((dtstr(date_val),norm(area),norm(incidence),str(occurrence)))
     return 'CAL-IFS-'+plant_code+'-'+hashlib.sha256(seed.encode('utf-8')).hexdigest()[:16].upper()
 
-def extract(blob, plant_code):
-    """Lee el formato corporativo 2026 (encabezados en fila 4).
+def registro_normalizado(value):
+    """Normaliza un identificador numérico de registro sin confundirlo con una fila."""
+    if value is None or pd.isna(value): return ''
+    value=str(value).strip()
+    if re.fullmatch(r'\d+(?:\.0+)?',value):
+        return str(int(float(value)))
+    return ''
 
-    Conserva soporte para plantillas antiguas con encabezados en fila 2.
-    """
-    frame=None; header_row=None
-    for candidate in (3,1):
-        attempt=pd.read_excel(io.BytesIO(blob),sheet_name=0,header=candidate,engine='openpyxl',dtype=object)
-        headers={norm(c).strip() for c in attempt.columns}
-        if any('incidencia detectada' in h for h in headers) and any(h.startswith('fecha') for h in headers):
-            frame=attempt;header_row=candidate+1;break
-    if frame is None: raise ValueError('No se reconocen las cabeceras del Excel de Calidad (fila 4).')
-    def find_header(*names):
-        for col in frame.columns:
-            h=re.sub(r'\s+',' ',norm(col).strip())
-            if any(h==n or h.startswith(n+' ') for n in names):return col
-        return None
-    col_fecha=find_header('fecha');col_area=find_header('zona/area','zona');col_inc=find_header('incidencia detectada')
-    col_acc=find_header('accion correctiva');col_evi=find_header('evidencia')
-    col_dep=find_header('departamento/ responsable implicado','departamento/responsable implicado','departamento/ responsable','departamento responsable')
-    col_prev=find_header('fecha estimada de cierre de incidencia','fecha estimada de cierre')
-    col_close=find_header('fecha de cierre');col_estado=find_header('estado de la incidencia','estado')
-    col_obs=find_header('observaciones');reportador_col=columna_reportado_por(frame);num_col=columna_numero(frame)
-    required={'Fecha':col_fecha,'Zona':col_area,'Incidencia':col_inc,'Responsable':col_dep,'Estado':col_estado}
-    missing=[k for k,v in required.items() if v is None]
-    if missing: raise ValueError('Faltan columnas requeridas: '+', '.join(missing))
-    def value(raw,col):return clean(raw[col]) if col is not None else ''
-    result=[];occurred=Counter()
+def columna_numero_registro(frame):
+    aliases={'numero de registro','n registro','nº registro','num registro',
+             'numero registro','registro','nro registro','no registro'}
+    for col in frame.columns:
+        label=norm(col).replace('_',' ').replace('.',' ').strip()
+        label=re.sub(r'\s+',' ',label)
+        label=label.replace('n°','n').replace('nº','n')
+        if label in aliases: return col
+    raise ValueError('No se encuentra la columna «Número de registro» en el Excel. Comprueba su encabezado.')
+
+def numeros_de_foto(path):
+    """Busca números completos en el nombre, sin usar números de carpeta."""
+    stem=os.path.splitext(os.path.basename(path))[0]
+    # Se aceptan prefijos típicos de fotografías; un sufijo 1,2,3 puede ser secuencia.
+    return {str(int(x)) for x in re.findall(r'(?<![A-Za-z0-9])\d+(?![A-Za-z0-9])',stem)}
+
+def extract(blob, plant_code):
+    frame=pd.read_excel(io.BytesIO(blob),sheet_name=0,header=1,engine='openpyxl',dtype=object)
+    if frame.shape[1]<10: raise ValueError('El Excel no contiene las diez columnas esperadas de Calidad.')
+    reportador_col=columna_reportado_por(frame)
+    registro_col=columna_numero_registro(frame)
+    result=[]; occurred=Counter()
     for ix,raw in frame.iterrows():
-        incident=value(raw,col_inc);area=value(raw,col_area);status=value(raw,col_estado)
-        dept=value(raw,col_dep);day=dtstr(raw[col_fecha]);number=numero_incidencia(raw[num_col]) if num_col is not None else ''
-        if not incident or not day:continue
+        row=list(raw.values)
+        incident=clean(row[3]); area=clean(row[2]); status=clean(row[9]); dept=clean(row[6]); day=dtstr(row[1])
+        if not incident or not day: continue
         signature=(day,norm(area),norm(incident));occurred[signature]+=1
-        ref=ident(raw[col_fecha],area,incident,occurred[signature],plant_code)
-        reporter=value(raw,reportador_col)
+        ref=ident(row[1],area,incident,occurred[signature],plant_code)
+        reportado_por=clean(raw[reportador_col]) if reportador_col is not None else ''
         maintenance='mantenimiento' in norm(dept)
         opened=norm(status) in ('abierta','abierto','pendiente')
-        result.append(dict(fila_excel=int(ix)+header_row+1,referencia=ref,fecha=day,zona=area,
-          incidencia=incident,numero_incidencia=number,accion_calidad=value(raw,col_acc),
-          evidencia=value(raw,col_evi),responsable=dept,fecha_prevista=dtstr(raw[col_prev]) if col_prev is not None else '',
-          fecha_cierre=dtstr(raw[col_close]) if col_close is not None else '',
-          estado=status,reportado_por=reporter,codigo_sugerido=codigo_por_iniciales(reporter),
-          observaciones=value(raw,col_obs),seleccion=bool(opened and maintenance),
-          revision=('Seleccionada' if opened and maintenance else 'No seleccionada')))
+        result.append(dict(fila_excel=int(ix)+3,numero_registro=registro_normalizado(raw[registro_col]),referencia=ref,fecha=day,zona=area,
+          incidencia=incident,accion_calidad=clean(row[4]),evidencia=clean(row[5]),
+          responsable=dept,fecha_prevista=dtstr(row[7]),fecha_cierre=dtstr(row[8]),
+          estado=status,reportado_por=reportado_por,codigo_sugerido=codigo_por_iniciales(reportado_por),
+          observaciones=clean(row[10]) if len(row)>10 else '',
+          seleccion=bool(opened and maintenance),revision=('Seleccionada' if opened and maintenance else 'No seleccionada')))
     return pd.DataFrame(result)
 
 def oauth():
@@ -318,7 +306,7 @@ def title(row):
     return ('AUDITORÍA IFS · '+text)[:200]
 
 def body_of(row,user_code,requested_by,urgent,plant_name,asset_code,group,category1,category2):
-    parts=[f"Origen: inspección interna IFS · {plant_name}",f"Referencia: {row['referencia']}",f"Fecha de detección: {row['fecha']}", f"Nº incidencia Calidad: {row.get('numero_incidencia','')}",f"Zona/área: {row['zona']}",f"Hallazgo de Calidad: {row['incidencia']}"]
+    parts=[f"Origen: inspección interna IFS · {plant_name}",f"Referencia: {row['referencia']}",f"Fecha de detección: {row['fecha']}",f"Zona/área: {row['zona']}",f"Hallazgo de Calidad: {row['incidencia']}"]
     for label,col in [('Acción correctiva indicada por Calidad','accion_calidad'),('Evidencia','evidencia'),('Responsable en Excel','responsable'),('Fecha objetivo de cierre','fecha_prevista'),('Observaciones','observaciones')]:
         val=str(row.get(col,'')).strip()
         if val: parts.append(f'{label}: {val}')
@@ -364,60 +352,22 @@ def photo_tokens(s):
 
 
 def match_photos(images, df):
-    """Solo asigna automáticamente coincidencias únicas y claras.
-
-    Reconoce referencia, fila indicada explícitamente, nombre de evidencia
-    suficientemente distintivo, o la fecha + texto distintivo del hallazgo.
-    Nunca asigna por orden de archivos ni por foto0001 a fila 1.
-    """
+    """Vincula por igualdad exacta del número de registro, sin similitud textual."""
+    by_number={}
+    for r in df.itertuples():
+        if r.numero_registro:
+            by_number.setdefault(r.numero_registro,set()).add(r.referencia)
     rows=[]
     for path in images:
-        stem=norm(os.path.splitext(os.path.basename(path))[0]); hits=[]
-        fullpath=norm(path)
-        label=os.path.splitext(os.path.basename(path))[0]
-        tokens=set(photo_tokens(label))
-        for r in df.itertuples():
-            ref=norm(r.referencia)
-            reason=None
-            if ref in fullpath:
-                reason='Referencia exacta'
-            elif re.search(r'(?<!\d)(?:fila|registro|hallazgo)[ _-]*0*'+str(r.fila_excel)+r'(?!\d)',stem):
-                reason='Número de fila explícito'
-            elif getattr(r,'numero_incidencia','') and re.match(
-                r'^(?:(?:incidencia|inc|n|no)[ _-]*)?0*'+re.escape(str(r.numero_incidencia))+r'(?=$|[ _.-]|º|ª)', stem):
-                # El numero se repite en auditorias de fechas diferentes. Solo asociar
-                # cuando es unico en el Excel, o el nombre/ruta identifica la fecha.
-                same=df[df['numero_incidencia'].astype(str)==str(r.numero_incidencia)]
-                datestring=re.sub(r'[^0-9]','',fullpath)
-                this_date=str(r.fecha).replace('-','')
-                same_date=same[same['fecha']==r.fecha]
-                if len(same)==1 or (this_date in datestring and len(same_date)==1):
-                    reason='Nº incidencia del Excel'+(' y fecha' if len(same)>1 else '')
-            if reason is None:
-                evidence=norm(r.evidencia)
-                # Nunca se considera el texto genérico «Foto» como identificador.
-                if len(evidence)>=10 and len(set(photo_tokens(evidence)))>=2 and evidence in stem:
-                    reason='Evidencia del Excel'
-                else:
-                    incident_tokens=set(photo_tokens(r.incidencia))
-                    meaningful=tokens & incident_tokens
-                    datepart=str(r.fecha).replace('-','')
-                    altdate=str(r.fecha).replace('-','_')
-                    has_date=(datepart in re.sub('[^0-9]','',stem) or altdate in stem)
-                    if has_date and len(meaningful)>=3 and len(tokens)>=3:
-                        reason='Fecha y palabras del hallazgo'
-                    elif (len(meaningful)>=4 and len(tokens)>=4
-                          and len(meaningful)/max(len(tokens),1)>=0.70):
-                        reason='Texto distintivo del hallazgo'
-            if reason: hits.append((r.referencia,reason))
-        unique={ref:why for ref,why in hits}
-        if len(unique)==1:
-            ref,why=next(iter(unique.items()))
-            rows.append({'fotografia':path,'referencia':ref,'coincidencia':why})
+        numbers=numeros_de_foto(path)
+        matched={ref for n in numbers for ref in by_number.get(n,set())}
+        if len(matched)==1:
+            ref=next(iter(matched))
+            rows.append({'fotografia':path,'referencia':ref,'coincidencia':'Número de registro exacto'})
         else:
             rows.append({'fotografia':path,'referencia':'(Sin asignar)',
-                         'coincidencia':'Varias posibles' if unique else 'Sin coincidencia fiable'})
-    return pd.DataFrame(rows)
+                         'coincidencia':'Registro ambiguo' if matched else 'Registro no encontrado'})
+    return pd.DataFrame(rows,columns=['fotografia','referencia','coincidencia'])
 
 # Reglas conservadoras de clasificación: se muestran y pueden editarse por fila.
 GROUP_OPTIONS=['Calidad / Ajuste / Especificación','Incidencia (sin paro)',
@@ -622,7 +572,7 @@ with st.expander('Revisar los hallazgos abiertos de otros departamentos'):
     st.dataframe(other[['fila_excel','zona','incidencia','responsable','estado']],hide_index=True,use_container_width=True)
 
 st.subheader('3 · Selecciona qué solicitudes crear')
-choices=['Solo abiertas de Mantenimiento (recomendado)','Todas las abiertas (revisión necesaria)','Mostrar todo el histórico']
+choices=['Solo abiertas de Mantenimiento (recomendado)']
 view_mode=st.radio('Vista',choices,index=0)
 if view_mode==choices[0]:view=df[df.seleccion].copy()
 elif view_mode==choices[1]:view=df[df.estado.map(norm).isin(('abierta','abierto','pendiente'))].copy()
@@ -661,7 +611,7 @@ if mark_all or unmark_all:
 if st.session_state['quality_selection_override'] is not None:
     view['seleccion']=st.session_state['quality_selection_override']
 st.caption('Estos botones afectan solo al resultado del filtro. Puedes ajustar cada incidencia individualmente.')
-cols=['seleccion','fila_excel','fecha','numero_incidencia','zona','incidencia','responsable','estado','referencia']
+cols=['seleccion','fila_excel','fecha','zona','incidencia','responsable','estado','referencia']
 editor_key=f"quality_editor_{selection_scope}_{st.session_state['quality_selection_revision']}"
 edited=st.data_editor(view[cols],hide_index=True,use_container_width=True,num_rows='fixed',key=editor_key,
     disabled=[c for c in cols if c!='seleccion'],column_config={
@@ -717,9 +667,10 @@ try:
             name=f'Galeria/{i:03d}_{os.path.basename(f.name)}'
             images[name]=content
     if images:
-        st.caption(f'{len(images)} fotografías encontradas. Las coincidencias claras se asignan automáticamente. Revisa y corrige las demás antes de enviar.')
-        mapping=match_photos(images,df)
-        options=['(Sin asignar)']+df['referencia'].tolist()
+        st.caption(f'{len(images)} fotografías examinadas. La asociación se realiza únicamente por el número de registro del Excel.')
+        mapping=match_photos(images,selected)
+        mapping=mapping[mapping['referencia']!='(Sin asignar)'].reset_index(drop=True)
+        options=['(Sin asignar)']+selected['referencia'].tolist()
         fingerprint=hashlib.sha256(blob)
         for name,content in images.items():
             fingerprint.update(name.encode('utf-8'));fingerprint.update(hashlib.sha256(content).digest())
@@ -728,7 +679,10 @@ try:
         for r in mapping.itertuples():
             if r.referencia!='(Sin asignar)': photo_map.setdefault(r.referencia,[]).append(r.fotografia)
         linked=sum(len(v) for v in photo_map.values())
-        st.info(f'Fotografías vinculadas: {linked} de {len(images)}. Sin vincular: {len(images)-linked}. Las fotos sin referencia segura requieren asignación manual.')
+        st.info(f'Fotografías de mantenimiento asociadas por número de registro: {linked}. Fotografías descartadas: {len(images)-linked}.')
+        summary=pd.DataFrame([{'Incidencia de mantenimiento':str(rec.incidencia),'Número de registro':str(rec.numero_registro),'Referencia':str(rec.referencia),'Fotos asociadas':len(photo_map.get(str(rec.referencia),[])),'Archivos':', '.join(os.path.basename(x) for x in photo_map.get(str(rec.referencia),[]))} for rec in selected.itertuples()])
+        st.subheader('Resumen de fotografías de mantenimiento')
+        st.dataframe(summary,hide_index=True,use_container_width=True)
         with st.expander('Vista previa de fotografías asociadas',expanded=bool(gallery_files)):
             for r in mapping.itertuples():
                 if r.referencia!='(Sin asignar)':
@@ -813,7 +767,7 @@ st.caption('Cada solicitud se asociará al activo provisional de su planta. Grup
 if not user_code.strip() or not requested_by.strip(): st.warning('Selecciona o introduce un código de usuario y completa el solicitante para continuar.');st.stop()
 
 st.subheader('4B · Solicitante por incidencia (opcional)')
-st.caption('Si el Excel incluye «Auditor» o «Reportado por», se calcula automáticamente el código con las iniciales, omitiendo de, del, la, las, los, el e y. Puedes corregir nombres y códigos. Para las filas sin nombre se utiliza el solicitante general del apartado 4.')
+st.caption('Si el Excel incluye «Reportado por», se calcula automáticamente el código con las iniciales, omitiendo de, del, la, las, los, el e y. Puedes corregir nombres y códigos. Para las filas sin nombre se utiliza el solicitante general del apartado 4.')
 users_table=pd.DataFrame([{
     'referencia':str(r.referencia), 'fila_excel':int(r.fila_excel),
     'reportado_por':str(r.reportado_por), 'user_code':str(r.codigo_sugerido)
@@ -970,7 +924,7 @@ with st.expander('Diagnóstico de la petición POST (sin datos personales ni tex
     st.write('Clasificación 2:', sample['types_2_description'])
     st.caption('No se muestran observaciones, descripción ni credenciales. El código 404 de Fracttal no demuestra por sí solo qué campo es inválido.')
 with st.expander('Vista previa: datos que se enviarán a Fracttal'):
-    preview=new[['referencia','fecha','numero_incidencia','zona','incidencia','accion_calidad']].copy()
+    preview=new[['referencia','fecha','numero_registro','zona','incidencia','accion_calidad']].copy()
     preview[['Grupo','C1','C2']]=preview['referencia'].apply(lambda ref:pd.Series(class_by_ref[ref]))
     preview['Reportado por']=preview['referencia'].map(lambda ref:reporters[ref][1])
     preview['Código usuario']=preview['referencia'].map(lambda ref:reporters[ref][0])
@@ -1040,5 +994,5 @@ if st.button('🚀 Crear solicitudes seleccionadas',type='primary',disabled=not 
             st.session_state.pop('audit_check',None)
     except Exception as e:st.error(str(e))
 
-st.caption('Versión 2.8 · Auditor y Nº incidencia desde Excel · Fotografías opcionales durante la creación y recuperación múltiple en 5B · Filtro de fechas y Grupo/C1/C2 individual.')
+st.caption('Versión 2.8 · Solicitante por incidencia desde Excel · Fotografías opcionales durante la creación y recuperación múltiple en 5B · Filtro de fechas y Grupo/C1/C2 individual.')
 st.caption('Puedes crear sin fotos y asociarlas después desde 5B. Si falla un adjunto, la solicitud ya creada NO se repite. Fuente: Excel del Departamento de Calidad. API oficial: https://api.fracttal.com/es/reference/crear-una-nueva-solicitud')
