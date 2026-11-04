@@ -13,7 +13,7 @@ import streamlit as st
 
 API = 'https://app.fracttal.com/api'
 TOKEN_URL = 'https://one.fracttal.com/oauth/token'
-APP_VER = '2.8'
+APP_VER = '2.10'
 st.set_page_config(page_title='Calidad → Fracttal | Europlátano', page_icon='📋', layout='wide')
 st.title('📋 Auditorías de Calidad → Solicitudes Fracttal')
 st.caption(f'Europlátano · V{APP_VER} · Solicitante automático por incidencia · fotos recuperables · fechas · clasificación · IFS / GLOBALG.A.P. · No crea órdenes de trabajo')
@@ -88,7 +88,7 @@ def columna_numero_registro(frame):
     aliases={'numero de registro','n registro','nº registro','num registro',
              'numero registro','registro','nro registro','no registro',
              'numero de incidencia','numero incidencia','n incidencia','num incidencia',
-             'nro incidencia','no incidencia','incidencia numero','incidencia n'}
+             'nro incidencia','no incidencia','incidencia numero','incidencia n', 'n incidencia', 'nº incidencia'}
     for col in frame.columns:
         label=norm(col).replace('_',' ').replace('.',' ').strip()
         label=re.sub(r'\s+',' ',label)
@@ -103,25 +103,25 @@ def numeros_de_foto(path):
     return {str(int(x)) for x in re.findall(r'(?<![A-Za-z0-9])\d+(?![A-Za-z0-9])',stem)}
 
 def extract(blob, plant_code):
-    frame=pd.read_excel(io.BytesIO(blob),sheet_name=0,header=1,engine='openpyxl',dtype=object)
+    frame=pd.read_excel(io.BytesIO(blob),sheet_name=0,header=3,engine='openpyxl',dtype=object)
     if frame.shape[1]<10: raise ValueError('El Excel no contiene las diez columnas esperadas de Calidad.')
     reportador_col=columna_reportado_por(frame)
     registro_col=columna_numero_registro(frame)
     result=[]; occurred=Counter()
     for ix,raw in frame.iterrows():
         row=list(raw.values)
-        incident=clean(row[3]); area=clean(row[2]); status=clean(row[9]); dept=clean(row[6]); day=dtstr(row[1])
+        incident=clean(row[3]); area=clean(row[2]); status=clean(row[10]); dept=clean(row[7]); day=dtstr(row[1])
         if not incident or not day: continue
         signature=(day,norm(area),norm(incident));occurred[signature]+=1
         ref=ident(row[1],area,incident,occurred[signature],plant_code)
         reportado_por=clean(raw[reportador_col]) if reportador_col is not None else ''
         maintenance='mantenimiento' in norm(dept)
         opened=norm(status) in ('abierta','abierto','pendiente')
-        result.append(dict(fila_excel=int(ix)+3,numero_registro=registro_normalizado(raw[registro_col]),referencia=ref,fecha=day,zona=area,
-          incidencia=incident,accion_calidad=clean(row[4]),evidencia=clean(row[5]),
-          responsable=dept,fecha_prevista=dtstr(row[7]),fecha_cierre=dtstr(row[8]),
+        result.append(dict(fila_excel=int(ix)+5,numero_registro=registro_normalizado(raw[registro_col]),referencia=ref,fecha=day,zona=area,
+          incidencia=incident,accion_calidad=clean(row[5]),evidencia=clean(row[6]),
+          responsable=dept,fecha_prevista=dtstr(row[8]),fecha_cierre=dtstr(row[9]),
           estado=status,reportado_por=reportado_por,codigo_sugerido=codigo_por_iniciales(reportado_por),
-          observaciones=clean(row[10]) if len(row)>10 else '',
+          observaciones=clean(row[12]) if len(row)>12 else '',
           seleccion=bool(opened and maintenance),revision=('Seleccionada' if opened and maintenance else 'No seleccionada')))
     return pd.DataFrame(result)
 
@@ -996,5 +996,5 @@ if st.button('🚀 Crear solicitudes seleccionadas',type='primary',disabled=not 
             st.session_state.pop('audit_check',None)
     except Exception as e:st.error(str(e))
 
-st.caption('Versión 2.8 · Solicitante por incidencia desde Excel · Fotografías opcionales durante la creación y recuperación múltiple en 5B · Filtro de fechas y Grupo/C1/C2 individual.')
+st.caption('Versión 2.10 · Solicitante por incidencia desde Excel · Fotografías opcionales durante la creación y recuperación múltiple en 5B · Filtro de fechas y Grupo/C1/C2 individual.')
 st.caption('Puedes crear sin fotos y asociarlas después desde 5B. Si falla un adjunto, la solicitud ya creada NO se repite. Fuente: Excel del Departamento de Calidad. API oficial: https://api.fracttal.com/es/reference/crear-una-nueva-solicitud')
