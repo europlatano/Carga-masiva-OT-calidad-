@@ -1,0 +1,998 @@
+"""Europlátano: importador controlado de hallazgos de auditoría a solicitudes Fracttal.
+Sin borrados, sin crear órdenes de trabajo. No conserva ficheros entre sesiones.
+"""
+from __future__ import annotations
+import hashlib, hmac, io, re, unicodedata, zipfile, os
+from collections import Counter
+from datetime import datetime, date, timezone
+from zoneinfo import ZoneInfo
+import requests
+from urllib.parse import urlsplit
+import pandas as pd
+import streamlit as st
+
+API = 'https://app.fracttal.com/api'
+TOKEN_URL = 'https://one.fracttal.com/oauth/token'
+APP_VER = '2.8'
+st.set_page_config(page_title='Calidad → Fracttal | Europlátano', page_icon='📋', layout='wide')
+st.title('📋 Auditorías de Calidad → Solicitudes Fracttal')
+st.caption(f'Europlátano · V{APP_VER} · Solicitante automático por incidencia · fotos recuperables · fechas · clasificación · IFS / GLOBALG.A.P. · No crea órdenes de trabajo')
+
+def sec(k):
+    try: return str(st.secrets.get(k,'')).strip()
+    except Exception: return ''
+
+pw=sec('APP_PASSWORD')
+if not pw:
+    st.error('Falta APP_PASSWORD en Streamlit → Settings → Secrets.'); st.stop()
+if not st.session_state.get('quality_login'):
+    with st.form('access'):
+        password=st.text_input('Contraseña de acceso', type='password')
+        entered=st.form_submit_button('Entrar')
+    if entered:
+        if hmac.compare_digest(password,pw): st.session_state.quality_login=True; st.rerun()
+        else: st.error('Contraseña incorrecta')
+    st.stop()
+with st.sidebar:
+    if st.button('Cerrar sesión'): st.session_state.quality_login=False; st.rerun()
+    st.info('No subas credenciales ni el Excel a un repositorio público. Las solicitudes son reales si confirmas el envío.')
+
+CID=sec('FRACTTAL_CLIENT_ID'); CSECRET=sec('FRACTTAL_CLIENT_SECRET')
+
+def norm(v):
+    s=unicodedata.normalize('NFKD',str(v or ''))
+    return ''.join(c for c in s if not unicodedata.combining(c)).strip().lower()
+
+PARTICULAS_NOMBRE = {'de', 'del', 'la', 'las', 'los', 'el', 'y'}
+
+def codigo_por_iniciales(nombre):
+    """Normaliza tildes/capitalización y omite partículas de nombres/apellidos."""
+    if not isinstance(nombre, str):
+        return ''
+    partes = re.findall(r'[a-z]+', norm(nombre))
+    return ''.join(p[0].upper() for p in partes if p not in PARTICULAS_NOMBRE)
+
+def columna_reportado_por(frame):
+    """Busca el encabezado de la columna opcional sin depender de su posición."""
+    aceptadas = {'reportado por', 'reportada por', 'persona que reporta',
+                 'nombre y apellidos del reportante', 'solicitante calidad'}
+    for col in frame.columns:
+        if re.sub(r'\s+', ' ', norm(col).replace('_',' ')) in aceptadas:
+            return col
+    return None
+
+def dtstr(v):
+    if isinstance(v,(datetime,date)): return v.strftime('%Y-%m-%d')
+    if pd.isna(v):return ''
+    q=pd.to_datetime(v,errors='coerce',dayfirst=True)
+    return q.strftime('%Y-%m-%d') if not pd.isna(q) else ''
+
+def clean(v):
+    if v is None or pd.isna(v): return ''
+    return str(v).strip()
+
+def ident(date_val, area, incidence, occurrence, plant_code):
+    # Referencia estable entre exportaciones aun si cambian el orden de filas.
+    seed='|'.join((dtstr(date_val),norm(area),norm(incidence),str(occurrence)))
+    return 'CAL-IFS-'+plant_code+'-'+hashlib.sha256(seed.encode('utf-8')).hexdigest()[:16].upper()
+
+def registro_normalizado(value):
+    """Normaliza un identificador numérico de registro sin confundirlo con una fila."""
+    if value is None or pd.isna(value): return ''
+    value=str(value).strip()
+    if re.fullmatch(r'\d+(?:\.0+)?',value):
+        return str(int(float(value)))
+    return ''
+
+def columna_numero_registro(frame):
+    aliases={'numero de registro','n registro','nº registro','num registro',
+             'numero registro','registro','nro registro','no registro'}
+    for col in frame.columns:
+        label=norm(col).replace('_',' ').replace('.',' ').strip()
+        label=re.sub(r'\s+',' ',label)
+        label=label.replace('n°','n').replace('nº','n')
+        if label in aliases: return col
+    raise ValueError('No se encuentra la columna «Número de registro» en el Excel. Comprueba su encabezado.')
+
+def numeros_de_foto(path):
+    """Busca números completos en el nombre, sin usar números de carpeta."""
+    stem=os.path.splitext(os.path.basename(path))[0]
+    # Se aceptan prefijos típicos de fotografías; un sufijo 1,2,3 puede ser secuencia.
+    return {str(int(x)) for x in re.findall(r'(?<![A-Za-z0-9])\d+(?![A-Za-z0-9])',stem)}
+
+def extract(blob, plant_code):
+    frame=pd.read_excel(io.BytesIO(blob),sheet_name=0,header=1,engine='openpyxl',dtype=object)
+    if frame.shape[1]<10: raise ValueError('El Excel no contiene las diez columnas esperadas de Calidad.')
+    reportador_col=columna_reportado_por(frame)
+    registro_col=columna_numero_registro(frame)
+    result=[]; occurred=Counter()
+    for ix,raw in frame.iterrows():
+        row=list(raw.values)
+        incident=clean(row[3]); area=clean(row[2]); status=clean(row[9]); dept=clean(row[6]); day=dtstr(row[1])
+        if not incident or not day: continue
+        signature=(day,norm(area),norm(incident));occurred[signature]+=1
+        ref=ident(row[1],area,incident,occurred[signature],plant_code)
+        reportado_por=clean(raw[reportador_col]) if reportador_col is not None else ''
+        maintenance='mantenimiento' in norm(dept)
+        opened=norm(status) in ('abierta','abierto','pendiente')
+        result.append(dict(fila_excel=int(ix)+3,numero_registro=registro_normalizado(raw[registro_col]),referencia=ref,fecha=day,zona=area,
+          incidencia=incident,accion_calidad=clean(row[4]),evidencia=clean(row[5]),
+          responsable=dept,fecha_prevista=dtstr(row[7]),fecha_cierre=dtstr(row[8]),
+          estado=status,reportado_por=reportado_por,codigo_sugerido=codigo_por_iniciales(reportado_por),
+          observaciones=clean(row[10]) if len(row)>10 else '',
+          seleccion=bool(opened and maintenance),revision=('Seleccionada' if opened and maintenance else 'No seleccionada')))
+    return pd.DataFrame(result)
+
+def oauth():
+    if not CID or not CSECRET: raise RuntimeError('Faltan FRACTTAL_CLIENT_ID y FRACTTAL_CLIENT_SECRET en Secrets.')
+    res=requests.post(TOKEN_URL,auth=(CID,CSECRET),data={'grant_type':'client_credentials'},timeout=25)
+    if res.status_code!=200: raise RuntimeError('Autenticación OAuth rechazada (HTTP %s).' % res.status_code)
+    body=res.json();token=body.get('access_token')
+    if not token:raise RuntimeError('Fracttal no devolvió token OAuth.')
+    return token
+
+def _safe_api_error(body):
+    """Muestra detalles de validación sin volcar tokens ni cuerpos de solicitudes."""
+    if not isinstance(body,dict):
+        return str(body)[:1000] if body else 'Fracttal no devolvió un error JSON interpretable.'
+    parts=[]
+    for key in ('message','error','error_description','detail','errors','data'):
+        value=body.get(key)
+        if not value: continue
+        if isinstance(value,dict):
+            for field,reason in list(value.items())[:12]:
+                parts.append(f'{field}: {reason}')
+        elif isinstance(value,list):
+            for entry in value[:12]:
+                if isinstance(entry,dict):
+                    parts.append(' | '.join(f'{k}: {v}' for k,v in entry.items() if k.lower() in ('error','message','field','property','code','detail','description')) or str(entry)[:250])
+                else: parts.append(str(entry))
+        else: parts.append(str(value))
+    msg=' | '.join(parts) if parts else 'Sin detalle de validación en la respuesta.'
+    # No mostrar accidentalmente credenciales ni datos completos de la solicitud.
+    for secret in (CID,CSECRET):
+        if secret: msg=msg.replace(secret,'[OCULTO]')
+    msg=re.sub(r'(?i)(bearer\s+)[A-Za-z0-9._-]+',r'\1[OCULTO]',msg)
+    return msg[:1200]
+
+def request(method,endpoint,token,*,payload=None,params=None):
+    headers={'Authorization':'Bearer '+token,'Accept':'application/json'}
+    if payload is not None: headers['Content-Type']='application/json'
+    res=requests.request(method,API+endpoint,headers=headers,json=payload,params=params,timeout=40)
+    try: body=res.json()
+    except ValueError: body={'detail':res.text[:500] if res.text else 'Respuesta vacía'}
+    if res.status_code>=400 or (isinstance(body,dict) and body.get('success') is False):
+        sent_fields=', '.join(sorted(payload.keys())) if isinstance(payload,dict) else '(sin JSON)'
+        raise RuntimeError(f'{method} {endpoint}: HTTP {res.status_code}. {_safe_api_error(body)} | Campos enviados: {sent_fields}')
+    return body
+
+def fetch_paged(token, endpoint):
+    """Lectura completa y conservadora de catálogos de Fracttal."""
+    items=[]
+    total=None
+    for start in range(0, 100000, 100):
+        response=request('GET',endpoint,token,params={'start':start,'limit':100})
+        if not isinstance(response,dict) or not isinstance(response.get('data'),list):
+            raise RuntimeError('Respuesta no verificable consultando '+endpoint)
+        try: n=int(response['total'])
+        except (KeyError,ValueError,TypeError):
+            raise RuntimeError('Fracttal no informa el total de '+endpoint)
+        if total is None: total=n
+        elif n!=total: raise RuntimeError('El listado cambió durante la consulta. Actualiza de nuevo.')
+        page=response['data']
+        if len(page)>100 or len(items)+len(page)>total:
+            raise RuntimeError('Paginación inconsistente en '+endpoint)
+        items.extend(page)
+        if len(items)==total: return items
+        if len(page)!=100: raise RuntimeError('Listado incompleto en '+endpoint)
+    raise RuntimeError('Límite de paginación superado en '+endpoint)
+
+def available_requesters(token):
+    """Obtiene recursos humanos y solo ofrece cuentas de Fracttal activas.
+
+    /accounts/ no está permitido a esta integración. La documentación
+    oficial expone account_active a través de /personnel/.
+    """
+    personnel=fetch_paged(token,'/personnel/')
+    accounts=[]
+    seen=set()
+    unknown=0
+    for person in personnel:
+        if not isinstance(person,dict) or person.get('active') is False:
+            continue
+        if person.get('account_active') is not True:
+            if person.get('account_active') is None:
+                unknown+=1
+            continue
+        code=str(person.get('code') or '').strip()
+        if not code or code in seen: continue
+        seen.add(code)
+        name=str(person.get('full_name') or person.get('name') or ' '.join(filter(None,[str(person.get('first_name') or '').strip(),str(person.get('last_name') or '').strip()])) or code).strip()
+        accounts.append({'nombre':name,'codigo':code})
+    return sorted(accounts,key=lambda p:(norm(p['nombre']),p['codigo'])),len(personnel),unknown
+
+
+def requesters_from_csv(blob):
+    """Alternativa de catálogo si /personnel/ está restringido por Fracttal.
+
+    Se interpreta un fichero preparado por el usuario o exportado de Fracttal.
+    Los códigos se validan de verdad al crear la primera solicitud.
+    """
+    try:
+        df=pd.read_csv(io.BytesIO(blob),sep=None,engine='python',dtype=str,encoding='utf-8-sig')
+    except UnicodeDecodeError:
+        df=pd.read_csv(io.BytesIO(blob),sep=None,engine='python',dtype=str,encoding='latin1')
+    aliases={
+        'nombre':{'nombre','name','full_name','nombre completo','nombres y apellidos','usuario'},
+        'codigo':{'codigo','code','user_code','codigo usuario','codigo recurso humano'},
+        'activo':{'account_active','cuenta activa','cuenta habilitada','habilitado','active'},
+    }
+    columns={}
+    for key,names in aliases.items():
+        for col in df.columns:
+            if norm(col).replace('_',' ') in {norm(n).replace('_',' ') for n in names}:
+                columns[key]=col;break
+    if 'nombre' not in columns or 'codigo' not in columns:
+        raise ValueError('El CSV debe contener las columnas Nombre y Código (o full_name y code).')
+    people=[];seen=set()
+    for _,row in df.iterrows():
+        name=str(row[columns['nombre']] or '').strip();code=str(row[columns['codigo']] or '').strip()
+        if not name or not code or name.lower()=='nan' or code.lower()=='nan' or code in seen: continue
+        if 'activo' in columns:
+            enabled=norm(row[columns['activo']])
+            if enabled not in ('true','1','si','yes','activo','habilitado'):continue
+        people.append({'nombre':name,'codigo':code});seen.add(code)
+    if not people: raise ValueError('El CSV no contiene usuarios seleccionables.')
+    return sorted(people,key=lambda p:(norm(p['nombre']),p['codigo']))
+
+def fetch_all(token, *, with_items=False):
+    """Recorre todas las páginas usando start/limit oficiales de Fracttal.
+
+    Ante inconsistencias, se interrumpe sin habilitar ninguna escritura.
+    """
+    page_size = 100
+    since = '2023-01-01T00:00:00-00'
+    until = datetime.now(timezone.utc).strftime('%Y-%m-%dT23:59:59-00')
+    found = []
+    seen_codes = set()
+    expected_total = None
+    for start in range(0, 100000, page_size):
+        params = {'since': since, 'until': until, 'start': start, 'limit': page_size}
+        data = request('GET', '/work_requests/', token, params=params)
+        if not isinstance(data, dict) or not isinstance(data.get('data'), list):
+            raise RuntimeError('Respuesta de Fracttal no verificable al consultar solicitudes.')
+        batch = data['data']
+        try:
+            total = int(data['total'])
+        except (KeyError, ValueError, TypeError):
+            raise RuntimeError('Fracttal no informó el total de solicitudes. Importación bloqueada.')
+        if expected_total is None:
+            expected_total = total
+        elif total != expected_total:
+            raise RuntimeError('El total de solicitudes cambió durante la paginación. Vuelve a consultar.')
+        if len(batch) > page_size or start + len(batch) > expected_total:
+            raise RuntimeError('Fracttal devolvió un bloque de tamaño incoherente. Importación bloqueada.')
+        if not batch and len(found) < expected_total:
+            raise RuntimeError('La paginación terminó antes de recuperar todas las solicitudes.')
+        for item in batch:
+            if not isinstance(item, dict) or item.get('id_code') is None:
+                raise RuntimeError('Solicitud sin identificador único en la consulta. Importación bloqueada.')
+            code = str(item['id_code'])
+            if code in seen_codes:
+                raise RuntimeError('Fracttal repitió solicitudes entre páginas. Importación bloqueada.')
+            seen_codes.add(code)
+            found.append(item)
+        if len(found) == expected_total:
+            break
+        if len(batch) != page_size:
+            raise RuntimeError('Página incompleta antes de llegar al total. Importación bloqueada.')
+    else:
+        raise RuntimeError('Se superó el límite de seguridad de paginación.')
+    if len(found) != expected_total:
+        raise RuntimeError(f'Consulta incompleta: {len(found)} de {expected_total}. Importación bloqueada.')
+    # identifier es la referencia oficial. Como respaldo, se busca la referencia
+    # también en las observaciones de solicitudes anteriores.
+    refs = set()
+    for item in found:
+        identifier = str(item.get('identifier') or '').strip()
+        if identifier:
+            refs.add(identifier)
+        observation = str(item.get('observation') or '')
+        refs.update(re.findall(r'CAL-IFS-[A-Z]{3}-[0-9A-F]{16}', observation, re.IGNORECASE))
+    return (refs, len(found), found) if with_items else (refs, len(found))
+
+def title(row):
+    text=re.sub(r'\s+',' ',str(row['incidencia'])).strip()
+    return ('AUDITORÍA IFS · '+text)[:200]
+
+def body_of(row,user_code,requested_by,urgent,plant_name,asset_code,group,category1,category2):
+    parts=[f"Origen: inspección interna IFS · {plant_name}",f"Referencia: {row['referencia']}",f"Fecha de detección: {row['fecha']}",f"Zona/área: {row['zona']}",f"Hallazgo de Calidad: {row['incidencia']}"]
+    for label,col in [('Acción correctiva indicada por Calidad','accion_calidad'),('Evidencia','evidencia'),('Responsable en Excel','responsable'),('Fecha objetivo de cierre','fecha_prevista'),('Observaciones','observaciones')]:
+        val=str(row.get(col,'')).strip()
+        if val: parts.append(f'{label}: {val}')
+    return {'user_code':user_code,'user_type':'HUMAN_RESOURCES','description':title(row),
+      'observation':'\n'.join(parts),'date_incident':row['fecha']+'T12:00:00-00',
+      'requested_by':requested_by[:200], 'identifier':row['referencia'],'is_urgent':bool(urgent),
+      'code':asset_code,'types_description':group,'types_1_description':category1,
+      'types_2_description':category2}
+
+MAX_ZIP_BYTES=180*1024*1024
+MAX_IMAGE_BYTES=20*1024*1024
+MAX_IMAGES=350
+PHOTO_EXT={'.jpg','.jpeg','.png','.gif','.bmp','.tif','.tiff'}
+
+def load_photos(blob):
+    if len(blob)>MAX_ZIP_BYTES: raise ValueError('ZIP demasiado grande (máximo 180 MB).')
+    images={}; total=0
+    with zipfile.ZipFile(io.BytesIO(blob)) as z:
+        for entry in z.infolist():
+            if entry.is_dir() or entry.filename.startswith('__MACOSX/') or os.path.basename(entry.filename).startswith('.'):
+                continue
+            name=entry.filename.replace('\\','/')
+            if name.startswith('/') or '..' in name.split('/') or entry.flag_bits & 1:
+                raise ValueError('ZIP con rutas no permitidas o archivos cifrados.')
+            if os.path.splitext(name)[1].lower() not in PHOTO_EXT: continue
+            if entry.file_size>MAX_IMAGE_BYTES: raise ValueError('Imagen demasiado grande: '+os.path.basename(name))
+            if len(images)>=MAX_IMAGES: raise ValueError('Hay más de 350 fotografías.')
+            total+=entry.file_size
+            if total>MAX_ZIP_BYTES: raise ValueError('Las imágenes descomprimidas superan 180 MB.')
+            content=z.read(entry)
+            if not content: continue
+            images[name]=content
+    return images
+
+def photo_tokens(s):
+    """Normaliza etiquetas de imagen sin aceptar coincidencias ambiguas."""
+    value=norm(s)
+    value=re.sub(r'[^a-z0-9]+',' ',value)
+    return [x for x in value.split() if len(x)>=3 and x not in {
+        'jpg','jpeg','png','foto','fotos','img','imagen','imagenes','dsc','photo',
+        'auditoria','calidad','ifs','palomares','captura','whatsapp','image',
+        'del','las','los','una','uno','con','para','por','que','esta','este','lado'}]
+
+
+def match_photos(images, df):
+    """Vincula por igualdad exacta del número de registro, sin similitud textual."""
+    by_number={}
+    for r in df.itertuples():
+        if r.numero_registro:
+            by_number.setdefault(r.numero_registro,set()).add(r.referencia)
+    rows=[]
+    for path in images:
+        numbers=numeros_de_foto(path)
+        matched={ref for n in numbers for ref in by_number.get(n,set())}
+        if len(matched)==1:
+            ref=next(iter(matched))
+            rows.append({'fotografia':path,'referencia':ref,'coincidencia':'Número de registro exacto'})
+        else:
+            rows.append({'fotografia':path,'referencia':'(Sin asignar)',
+                         'coincidencia':'Registro ambiguo' if matched else 'Registro no encontrado'})
+    return pd.DataFrame(rows,columns=['fotografia','referencia','coincidencia'])
+
+# Reglas conservadoras de clasificación: se muestran y pueden editarse por fila.
+GROUP_OPTIONS=['Calidad / Ajuste / Especificación','Incidencia (sin paro)',
+    'Mejora / Solicitud (no avería)','Seguridad / Riesgo / Medioambiente','Avería (con paro)']
+CAT1_OPTIONS=['Infraestructura y edificio','Aire comprimido y neumática',
+    'Automatización y control (PLC, HMI, variadores, sensores)',
+    'Electricidad potencia (cuadros, protecciones, motores)',
+    'Envasado / embolsado / sellado','Etiquetado / impresión',
+    'Frío industrial (cámaras/túnel)','Hidráulica / bombeo / fluidos',
+    'Lavado / agua de proceso / drenajes','Paletizado / flejado',
+    'Pesaje / control / detección','Transportadores y movimiento',
+    'Vehículos de transporte (carretera / recogida)',
+    'Vehículos industriales (carretillas, transpaletas, etc.)']
+CAT2_OPTIONS=['Otros / no sé','Alarma / error','Atasco / bloqueo','Está roto',
+    'Falta elemento/ inexistente','Falta nivel / falta presión / falta suministro',
+    'Funciona pero mal','Hace ruido anormal','Huele mal / quemado / humo',
+    'No funciona / no arranca','Pierde líquido / fuga','Roto / partido',
+    'Se calienta','Se para / falla a ratos','Suelto / desajustado','Vibra']
+
+def contains_any(text, terms):
+    return any(x in text for x in terms)
+
+def suggest_classification(row):
+    issue=norm(row['incidencia'])
+    zone=norm(row['zona'])
+    text=issue+' '+zone
+    # Prioridad a la naturaleza del hallazgo, no a términos aislados de su zona.
+    if contains_any(issue,['riesgo','peligro','accidente','proteccion','resbal','seguridad','barandilla','extintor','emergencia','incendio']):
+        group=GROUP_OPTIONS[3]
+    elif contains_any(issue,['averia','parada de linea','linea parada','no funciona','sin funcionar','no arranca']):
+        group=GROUP_OPTIONS[4]
+    elif contains_any(issue,['instalar','incorporar','mejorar','se solicita','ampliar','colocar una nueva','colocar un nuevo']):
+        group=GROUP_OPTIONS[2]
+    elif contains_any(issue,['fuga','gotea','pierde','roto','rota','rotura','deterior','desajust','averiad']):
+        group=GROUP_OPTIONS[1]
+    else:
+        group=GROUP_OPTIONS[0]
+
+    rules=[
+        (['compresor','neumatic','racor','presion de aire','aire comprimido','cilindro neumatic'],1),
+        (['plc','automata','sensor','fotocelula','inductivo','variador','pantalla hmi'],2),
+        (['cuadro electric','enchufe','interruptor','cable','iluminacion','luminaria','electri','magnetotermico'],3),
+        (['selladora','embolsa','flow pack','envasad','film'],4),
+        (['etiqueta','etiquetad','impresora','impresion','codificad'],5),
+        (['frigorif','evaporad','condensad','refriger','camara de maduracion','camara frigorifica','tunel de frio'],6),
+        (['bomba','hidrauli','deposito de agua','tuberia de agua','valvula de agua'],7),
+        (['lavado','lavadora','desague','drenaje','agua de proceso','boquilla de agua'],8),
+        (['paleti','flejadora','flejad','portico','pinza'],9),
+        (['bascula','pesaj','pesadora','detector de metal'],10),
+        (['transportador','cinta','banda','rodillo','cadena transportadora'],11),
+        (['camion','remolque','vehiculo de transporte'],12),
+        (['carretilla','transpaleta','apilador','montacargas'],13),
+    ]
+    c1=CAT1_OPTIONS[0]
+    for keys,i in rules:
+        if contains_any(issue,keys): c1=CAT1_OPTIONS[i];break
+    else:
+        # Área como pista secundaria si el texto del hallazgo no identifica máquina.
+        for keys,i in rules:
+            if contains_any(zone,keys): c1=CAT1_OPTIONS[i];break
+    if contains_any(issue,['no funciona','no arranca','no enciende','no trabaja']): c2='No funciona / no arranca'
+    elif contains_any(issue,['alarma','mensaje de error','codigo de error']): c2='Alarma / error'
+    elif contains_any(issue,['atascad','atasco','bloquead']): c2='Atasco / bloqueo'
+    elif contains_any(issue,['fuga','gote','pierde agua','pierde aceite','filtracion']): c2='Pierde líquido / fuga'
+    elif contains_any(issue,['humo','quemado','olor a quemado']): c2='Huele mal / quemado / humo'
+    elif contains_any(issue,['vibra']): c2='Vibra'
+    elif contains_any(issue,['ruido','chirrido']): c2='Hace ruido anormal'
+    elif contains_any(issue,['calienta','sobrecalent']): c2='Se calienta'
+    elif contains_any(issue,['intermitente','a ratos','se para']): c2='Se para / falla a ratos'
+    elif contains_any(issue,['suelto','aflojad','desajust','desnivel','flojo']): c2='Suelto / desajustado'
+    elif contains_any(issue,['roto','rota','rotura','fractura','partido','partida','rajad','grieta']): c2='Roto / partido'
+    elif contains_any(issue,['deteriorad','defectuos','funciona mal','mal funcionamiento']): c2='Funciona pero mal'
+    elif contains_any(issue,['falta','no existe','inexistente','ausencia','sin proteccion','carece de']): c2='Falta elemento/ inexistente'
+    else: c2='Otros / no sé'
+    return group,c1,c2
+
+
+def secure_s3_upload_url(host, bucket):
+    """Acepta URLs HTTPS S3 firmadas, incluso si el API omite el esquema.
+
+    No se permite enviar fotos a destinos arbitrarios, redirecciones ni HTTP.
+    El bucket devuelto por Fracttal debe coincidir con el destino.
+    """
+    if not isinstance(host, str) or not host.strip():
+        raise RuntimeError('Fracttal no devolvió un destino de subida válido.')
+    raw = host.strip()
+    if raw.startswith('//'):
+        raw = 'https:' + raw
+    elif '://' not in raw:
+        raw = 'https://' + raw
+    parsed = urlsplit(raw)
+    domain = (parsed.hostname or '').lower().rstrip('.')
+    bucket = str(bucket or '').strip().lower()
+    if (parsed.scheme != 'https' or not domain or parsed.username or
+            parsed.password or parsed.port not in (None, 443) or
+            not bucket or not re.fullmatch(r'[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]', bucket)):
+        raise RuntimeError('Destino de subida no seguro (formato HTTPS o bucket inválido).')
+    # AWS S3: estilo de host bucket.s3.amazonaws.com, regional o accelerate.
+    # También admite endpoint path-style regional s3.<region>.amazonaws.com/<bucket>.
+    s3_virtual = re.fullmatch(r'(?:s3(?:[.-][a-z0-9-]+)*\.)amazonaws\.com(?:\.cn)?', domain[len(bucket)+1:]) if domain.startswith(bucket + '.') else None
+    s3_path = re.fullmatch(r's3(?:[.-][a-z0-9-]+)*\.amazonaws\.com(?:\.cn)?', domain)
+    if s3_virtual:
+        if parsed.path not in ('', '/'):
+            raise RuntimeError('Destino S3 con ruta no esperada; revisión necesaria.')
+    elif s3_path:
+        # Fracttal puede devolver host S3 genérico SIN el bucket en su ruta.
+        # En ese caso el POST multipart debe dirigirse a /<bucket>/ (path-style).
+        path = parsed.path.rstrip('/')
+        if path in ('', '/'):
+            raw = raw.rstrip('/') + '/' + bucket + '/'
+        elif path != '/' + bucket:
+            raise RuntimeError('El bucket S3 no coincide con la ruta de subida.')
+    else:
+        # No se enseña la URL completa: puede contener credenciales temporales.
+        raise RuntimeError('Host de subida no reconocido como S3 oficial. Dominio: ' + domain[:150])
+    if parsed.query or parsed.fragment:
+        raise RuntimeError('Destino S3 con parámetros inesperados; revisión necesaria.')
+    return raw
+
+
+def upload_photo(token, filename, content):
+    signed=request('POST','/s3_object/',token,payload={'name':os.path.basename(filename),'size':len(content)})
+    d=signed.get('data') if isinstance(signed,dict) else None
+    required=('host','key','bucket','acl','policy','credential','date','signature')
+    if not isinstance(d,dict) or not all(d.get(x) for x in required):
+        raise RuntimeError('Fracttal no devolvió las credenciales completas de subida.')
+    fields=[('key',d['key']),('acl',d['acl']),('policy',d['policy']),('x-amz-credential',d['credential']),('x-amz-algorithm','AWS4-HMAC-SHA256'),('x-amz-date',d['date']),('x-amz-signature',d['signature']),('success_action_status','200')]
+    host=secure_s3_upload_url(d['host'], d['bucket'])
+    res=requests.post(host,data=fields,files={'file':(os.path.basename(filename),io.BytesIO(content))},timeout=90,allow_redirects=False)
+    if res.status_code not in (200,201,204):
+        raise RuntimeError('No se pudo transferir la fotografía a S3 (HTTP %s). No se ha vinculado.' % res.status_code)
+    return d['key']
+
+def attach_photos(token, request_id, assigned, images):
+    """Sube y asocia fotos; verifica claves en la respuesta de Fracttal.
+
+    Si la respuesta es ambigua, NO reintentar automáticamente para evitar duplicados.
+    """
+    paths=[]
+    for path in assigned:
+        key=upload_photo(token,path,images[path])
+        paths.append({'name':key,'description':'Evidencia de Calidad: '+os.path.basename(path)})
+    if not paths:
+        return 0
+    result=request('POST',f'/work_requests_attachments_files/{int(request_id)}',token,
+                   payload={'id_status':1,'paths':paths})
+    if not isinstance(result,dict) or result.get('success') is not True or not isinstance(result.get('data'),list):
+        raise RuntimeError('Asociación sin confirmación verificable; comprueba los adjuntos en Fracttal antes de reintentar.')
+    actual={str(a.get('path') or '') for a in result['data'] if isinstance(a,dict) and a.get('type') in (1,'1')}
+    missing=[p['name'] for p in paths if p['name'] not in actual]
+    if missing:
+        raise RuntimeError(f'Fracttal no confirmó {len(missing)} de {len(paths)} imágenes. Revisa antes de reintentar.')
+    return len(paths)
+
+
+def request_reference(item):
+    """Referencia registrada en la solicitud, también para solicitudes antiguas."""
+    identifier=str(item.get('identifier') or '').strip()
+    if re.fullmatch(r'CAL-IFS-[A-Z]{3}-[0-9A-F]{16}',identifier,re.I):
+        return identifier.upper()
+    observation=str(item.get('observation') or '')
+    match=re.search(r'CAL-IFS-[A-Z]{3}-[0-9A-F]{16}',observation,re.I)
+    return match.group(0).upper() if match else ''
+
+
+def response_id(response):
+    data=response.get('data') if isinstance(response,dict) else None
+    if isinstance(data,list) and len(data)==1: data=data[0]
+    if isinstance(data,dict):
+        value=data.get('id_code',data.get('id'))
+        if value is not None: return int(value)
+    return None
+
+PLANTS = {
+    'Palomares': ('PAL','GEN-CAL-PAL'),
+    'Puntallana': ('PUN','GEN-CAL-PUN'),
+    'Tenerife Sur': ('TFS','GEN-CAL-TFS'),
+    'Tenerife Norte': ('TFN','GEN-CAL-TFN'),
+    'La Caleta': ('LCL','GEN-CAL-LCL'),
+    'Puerto de la Cruz': ('PTC','GEN-CAL-PTC'),
+    'El Hierro': ('HIE','GEN-CAL-HIE'),
+}
+st.subheader('0 · Centro de trabajo')
+plant_name=st.selectbox('Planta a la que corresponden las incidencias',list(PLANTS),key='quality_plant')
+plant_code,asset_code=PLANTS[plant_name]
+st.info(f'Activo provisional de Fracttal: {asset_code} · Centro: {plant_name}')
+upload=st.file_uploader('1 · Selecciona el Excel original del Departamento de Calidad',type=['xlsx'])
+if upload is None:
+    st.info('Sube el Excel de Inspecciones internas IFS de la planta seleccionada. Por defecto se seleccionarán únicamente las incidencias ABIERTAS asignadas a Mantenimiento, incluidas las compartidas.');st.stop()
+blob=upload.getvalue()
+try: df=extract(blob,plant_code)
+except Exception as exc: st.error(f'No se pudo interpretar el Excel: {exc}');st.stop()
+if df.empty:st.warning('No se encontraron registros válidos.');st.stop()
+sc=norm('abierta')
+open_count=sum(norm(x) in ('abierta','abierto','pendiente') for x in df.estado)
+selected_default=int(df.seleccion.sum())
+st.subheader('2 · Análisis del archivo')
+a,b,c=st.columns(3);a.metric('Hallazgos con fecha',len(df));b.metric('Abiertos',open_count);c.metric('Abiertos de Mantenimiento',selected_default)
+st.caption('La selección es automática, pero puedes desmarcar cualquier incidencia antes de importar. No se importan las cerradas por defecto.')
+with st.expander('Revisar los hallazgos abiertos de otros departamentos'):
+    other=df[(df.estado.map(norm).isin(('abierta','abierto','pendiente'))) & (~df.responsable.map(norm).str.contains('mantenimiento'))]
+    st.dataframe(other[['fila_excel','zona','incidencia','responsable','estado']],hide_index=True,use_container_width=True)
+
+st.subheader('3 · Selecciona qué solicitudes crear')
+choices=['Solo abiertas de Mantenimiento (recomendado)']
+view_mode=st.radio('Vista',choices,index=0)
+if view_mode==choices[0]:view=df[df.seleccion].copy()
+elif view_mode==choices[1]:view=df[df.estado.map(norm).isin(('abierta','abierto','pendiente'))].copy()
+else:view=df.copy()
+
+# Fechas de detección del Excel: filtros inclusivos y claros, sin afectar el histórico.
+dates=pd.to_datetime(df['fecha'],errors='coerce')
+min_day=dates.min().date();max_day=dates.max().date()
+excel_key=hashlib.sha256(blob+plant_code.encode()).hexdigest()[:12]
+filter_dates=st.checkbox('Filtrar por fecha de detección',value=False,key='quality_use_date_filter_'+excel_key)
+filter_start=min_day;filter_end=max_day
+if filter_dates:
+    fa,fb=st.columns(2)
+    with fa: filter_start=st.date_input('Desde (incluido)',value=min_day,min_value=min_day,max_value=max_day,key='quality_start_date_'+excel_key)
+    with fb: filter_end=st.date_input('Hasta (incluido)',value=max_day,min_value=min_day,max_value=max_day,key='quality_end_date_'+excel_key)
+    if filter_start>filter_end:
+        st.error('La fecha inicial no puede ser posterior a la final.');st.stop()
+    view=view[(view['fecha']>=filter_start.isoformat()) & (view['fecha']<=filter_end.isoformat())]
+st.caption(f'Incidencias visibles tras los filtros: {len(view)}. Las fechas se aplican a la detección, no al cierre.')
+if view.empty:
+    st.warning('No hay incidencias con esos filtros. Amplía las fechas o modifica la vista.');st.stop()
+
+# Reinicia exclusivamente cuando cambia el archivo, la planta o el conjunto visible.
+selection_scope=hashlib.sha256((hashlib.sha256(blob).hexdigest()+plant_code+view_mode+
+    ','.join(view['referencia'].tolist())).encode()).hexdigest()[:20]
+if st.session_state.get('quality_selection_scope')!=selection_scope:
+    st.session_state['quality_selection_scope']=selection_scope
+    st.session_state['quality_selection_revision']=0
+    st.session_state['quality_selection_override']=None
+left,right=st.columns(2)
+with left: mark_all=st.button('☑️ Marcar todas las visibles',use_container_width=True,key='quality_mark_all')
+with right: unmark_all=st.button('⬜ Desmarcar todas las visibles',use_container_width=True,key='quality_unmark_all')
+if mark_all or unmark_all:
+    st.session_state['quality_selection_override']=bool(mark_all)
+    st.session_state['quality_selection_revision']+=1
+if st.session_state['quality_selection_override'] is not None:
+    view['seleccion']=st.session_state['quality_selection_override']
+st.caption('Estos botones afectan solo al resultado del filtro. Puedes ajustar cada incidencia individualmente.')
+cols=['seleccion','fila_excel','fecha','zona','incidencia','responsable','estado','referencia']
+editor_key=f"quality_editor_{selection_scope}_{st.session_state['quality_selection_revision']}"
+edited=st.data_editor(view[cols],hide_index=True,use_container_width=True,num_rows='fixed',key=editor_key,
+    disabled=[c for c in cols if c!='seleccion'],column_config={
+        'seleccion':st.column_config.CheckboxColumn('Importar'),
+        'incidencia':st.column_config.TextColumn('Hallazgo',width='large'),
+        'zona':st.column_config.TextColumn('Zona',width='medium')})
+selected_refs=set(edited.loc[edited['seleccion']==True,'referencia'].tolist())
+selected=df[df.referencia.isin(selected_refs)].copy()
+st.caption(f'Seleccionadas para revisión: {len(selected)}. Las ya existentes se excluirán tras consultar Fracttal.')
+if selected.empty:st.stop()
+
+st.subheader('3A · Grupo y clasificaciones propuestas por incidencia')
+st.caption('Propuesta automática por palabras del hallazgo y la zona. Revisa cada fila, especialmente «Otros / no sé». Puedes cambiar Grupo, C1 y C2 de forma independiente.')
+classification_rows=[]
+for _,rec in selected.iterrows():
+    gr,c1,c2=suggest_classification(rec)
+    classification_rows.append({'referencia':rec['referencia'],'fecha':rec['fecha'],
+        'incidencia':rec['incidencia'],'Grupo':gr,'C1':c1,'C2':c2})
+class_df=pd.DataFrame(classification_rows)
+class_fingerprint=hashlib.sha256((hashlib.sha256(blob).hexdigest()+plant_code+
+    ','.join(class_df['referencia'].tolist())).encode()).hexdigest()[:18]
+classes_edited=st.data_editor(class_df,hide_index=True,use_container_width=True,num_rows='fixed',
+    key='quality_classes_'+class_fingerprint,disabled=['referencia','fecha','incidencia'],
+    column_config={'incidencia':st.column_config.TextColumn('Hallazgo',width='large'),
+    'Grupo':st.column_config.SelectboxColumn('Grupo',options=GROUP_OPTIONS,required=True),
+    'C1':st.column_config.SelectboxColumn('Clasificación 1',options=CAT1_OPTIONS,required=True),
+    'C2':st.column_config.SelectboxColumn('Clasificación 2',options=CAT2_OPTIONS,required=True)})
+class_by_ref={str(r.referencia):(r.Grupo,r.C1,r.C2) for r in classes_edited.itertuples()}
+if len(class_by_ref)!=len(selected) or any(any(v not in opts for v,opts in zip(vals,(GROUP_OPTIONS,CAT1_OPTIONS,CAT2_OPTIONS))) for vals in class_by_ref.values()):
+    st.error('Hay clasificaciones incompletas o no válidas.');st.stop()
+unknown=sum(v[2]=='Otros / no sé' for v in class_by_ref.values())
+if unknown:st.warning(f'{unknown} incidencia(s) tienen C2 «Otros / no sé». Revisa si corresponde una opción más concreta.')
+
+st.subheader('3B · Fotografías de las incidencias')
+photo_zip=st.file_uploader('Opción A · ZIP con fotografías de Calidad',type=['zip'],key='photos_zip')
+gallery_files=st.file_uploader('Opción B · Selecciona fotos directamente desde la galería o Archivos (sin ZIP)',type=['jpg','jpeg','png','gif','bmp','tif','tiff'],accept_multiple_files=True,key='photos_gallery',help='En iPad, pulsa Browse files / Examinar archivos y selecciona Fototeca si Safari ofrece esa opción. También puedes elegir fotos guardadas en Archivos.')
+images={}; photo_map={}; photo_error=False
+try:
+    if photo_zip is not None:
+        images.update(load_photos(photo_zip.getvalue()))
+    if gallery_files:
+        if len(images)+len(gallery_files)>MAX_IMAGES:
+            raise ValueError('Se supera el máximo de 350 fotografías.')
+        total_bytes=sum(len(v) for v in images.values())
+        for i,f in enumerate(gallery_files,1):
+            content=f.getvalue()
+            if len(content)>MAX_IMAGE_BYTES:
+                raise ValueError('Imagen demasiado grande: '+f.name)
+            total_bytes+=len(content)
+            if total_bytes>MAX_ZIP_BYTES:
+                raise ValueError('Las imágenes superan 180 MB en total.')
+            # El prefijo identifica la carga de galería y evita colisiones con nombres del ZIP.
+            name=f'Galeria/{i:03d}_{os.path.basename(f.name)}'
+            images[name]=content
+    if images:
+        st.caption(f'{len(images)} fotografías examinadas. La asociación se realiza únicamente por el número de registro del Excel.')
+        mapping=match_photos(images,selected)
+        mapping=mapping[mapping['referencia']!='(Sin asignar)'].reset_index(drop=True)
+        options=['(Sin asignar)']+selected['referencia'].tolist()
+        fingerprint=hashlib.sha256(blob)
+        for name,content in images.items():
+            fingerprint.update(name.encode('utf-8'));fingerprint.update(hashlib.sha256(content).digest())
+        editor_key='photo_map_'+fingerprint.hexdigest()[:14]
+        mapping=st.data_editor(mapping,key=editor_key,hide_index=True,use_container_width=True,num_rows='fixed',disabled=['fotografia','coincidencia'],column_config={'referencia':st.column_config.SelectboxColumn('Incidencia / referencia',options=options,required=True),'fotografia':st.column_config.TextColumn('Archivo',width='large'),'coincidencia':st.column_config.TextColumn('Motivo de asociación',width='medium')})
+        for r in mapping.itertuples():
+            if r.referencia!='(Sin asignar)': photo_map.setdefault(r.referencia,[]).append(r.fotografia)
+        linked=sum(len(v) for v in photo_map.values())
+        st.info(f'Fotografías de mantenimiento asociadas por número de registro: {linked}. Fotografías descartadas: {len(images)-linked}.')
+        summary=pd.DataFrame([{'Incidencia de mantenimiento':str(rec.incidencia),'Número de registro':str(rec.numero_registro),'Referencia':str(rec.referencia),'Fotos asociadas':len(photo_map.get(str(rec.referencia),[])),'Archivos':', '.join(os.path.basename(x) for x in photo_map.get(str(rec.referencia),[]))} for rec in selected.itertuples()])
+        st.subheader('Resumen de fotografías de mantenimiento')
+        st.dataframe(summary,hide_index=True,use_container_width=True)
+        with st.expander('Vista previa de fotografías asociadas',expanded=bool(gallery_files)):
+            for r in mapping.itertuples():
+                if r.referencia!='(Sin asignar)':
+                    st.write(f'{r.fotografia} → {r.referencia}')
+                    if os.path.splitext(r.fotografia)[1].lower() in ('.jpg','.jpeg','.png','.gif'):
+                        st.image(images[r.fotografia],width=260)
+        selected_photo_count=sum(len(photo_map.get(ref,[])) for ref in selected_refs)
+        st.caption(f'Fotografías que se intentarán adjuntar a las solicitudes seleccionadas: {selected_photo_count}.')
+    elif photo_zip is not None:
+        st.warning('El ZIP no contiene fotografías compatibles.')
+except Exception as exc:
+    st.error('No se pudieron preparar las fotografías: '+str(exc));photo_error=True
+if photo_error: st.stop()
+
+st.subheader('4 · Configuración de Fracttal')
+st.caption('Selecciona quién reporta las solicitudes. Fracttal identifica al solicitante por su código de recurso humano (user_code).')
+if st.button('👥 Consultar usuarios con cuenta activa',key='load_requesters'):
+    try:
+        people,total,unknown=available_requesters(oauth())
+        st.session_state['quality_requesters']=people
+        st.session_state['quality_requesters_source']='API de Fracttal /personnel/'
+        st.session_state.pop('quality_users_error',None)
+        if people:
+            st.success(f'Usuarios con cuenta activa: {len(people)} (entre {total} recursos humanos).')
+        else:
+            st.warning('Fracttal permitió consultar personal, pero no devolvió cuentas habilitadas verificables. Puedes cargar un CSV o usar un código manual.')
+        if unknown:
+            st.caption(f'{unknown} recursos no informaron account_active y no se muestran como cuentas verificadas.')
+    except Exception as exc:
+        st.session_state.pop('quality_requesters',None)
+        st.session_state['quality_users_error']=str(exc)[:300]
+        st.warning('Fracttal no permite consultar el listado con esta integración. Puedes cargar un CSV de usuarios como alternativa.')
+        st.caption('Detalle técnico: '+st.session_state['quality_users_error'])
+
+with st.expander('Alternativa si Fracttal bloquea la consulta: importar lista de usuarios CSV'):
+    st.caption('Archivo local con columnas Nombre,Código y opcionalmente Cuenta activa. No se guarda en GitHub ni se utiliza para crear cuentas. Comprueba que los códigos corresponden a usuarios habilitados.')
+    manual_users_file=st.file_uploader('Listado de usuarios CSV',type=['csv'],key='users_csv')
+    if manual_users_file is not None and st.button('📋 Cargar usuarios del CSV',key='load_users_csv'):
+        try:
+            people=requesters_from_csv(manual_users_file.getvalue())
+            st.session_state['quality_requesters']=people
+            st.session_state['quality_requesters_source']='CSV aportado por el usuario (cuentas no verificadas mediante API)'
+            st.success(f'Se han cargado {len(people)} usuarios para el desplegable.')
+        except Exception as exc:st.error('No se pudo cargar el CSV: '+str(exc))
+
+people=st.session_state.get('quality_requesters',[])
+source=st.session_state.get('quality_requesters_source','')
+mode=st.radio('Cómo elegir el solicitante',
+    ['Elegir del desplegable','Introducir código manualmente'],
+    index=0 if people else 1,key='quality_requester_mode')
+user_code=''
+selected_person_name=''
+if mode=='Elegir del desplegable':
+    if people:
+        codes=[p['codigo'] for p in people]
+        default_idx=codes.index('ARM') if 'ARM' in codes else 0
+        selected_code=st.selectbox('Usuario que reporta a Fracttal',codes,
+            index=default_idx,format_func=lambda code:next((p['nombre']+' · '+p['codigo'] for p in people if p['codigo']==code),code),key='quality_selected_user')
+        user_code=selected_code
+        selected_person_name=next((p['nombre'] for p in people if p['codigo']==user_code),'')
+        st.caption('Fuente: '+source+' · Código enviado a Fracttal: '+user_code)
+    else:
+        st.warning('Aún no hay usuarios cargados. Pulsa «Consultar usuarios», importa un CSV o selecciona la entrada manual.')
+else:
+    user_code=st.text_input('Código de usuario en Fracttal (user_code)',value='ARM',
+        help='Debe coincidir con el código del recurso humano que tiene una cuenta de usuario habilitada.').strip()
+    st.caption('Código manual: no se verifica mediante listado. ARM se comprobó en la cuenta de Fracttal facilitada.')
+
+if selected_person_name:
+    st.info('Solicitante elegido: **'+selected_person_name+'** (código '+user_code+').')
+    if st.session_state.get('quality_previous_selected_code') != user_code:
+        st.session_state['quality_requested_by']=selected_person_name
+    st.session_state['quality_previous_selected_code']=user_code
+else:
+    st.session_state['quality_previous_selected_code']=None
+requested_by=st.text_input('Texto «Solicitado por» de la solicitud',
+    value=selected_person_name if selected_person_name else 'Departamento de Calidad – Europlátano',
+    help='Puedes cambiar este texto. El usuario autenticado asociado a la solicitud se establece con user_code.',
+    key='quality_requested_by')
+urgency=st.selectbox('Urgencia por defecto', ['No urgente (recomendado)','Urgente (solo si procede)'])
+st.caption('Cada solicitud se asociará al activo provisional de su planta. Grupo, C1 y C2 se seleccionan por incidencia en el apartado 3A.')
+if not user_code.strip() or not requested_by.strip(): st.warning('Selecciona o introduce un código de usuario y completa el solicitante para continuar.');st.stop()
+
+st.subheader('4B · Solicitante por incidencia (opcional)')
+st.caption('Si el Excel incluye «Reportado por», se calcula automáticamente el código con las iniciales, omitiendo de, del, la, las, los, el e y. Puedes corregir nombres y códigos. Para las filas sin nombre se utiliza el solicitante general del apartado 4.')
+users_table=pd.DataFrame([{
+    'referencia':str(r.referencia), 'fila_excel':int(r.fila_excel),
+    'reportado_por':str(r.reportado_por), 'user_code':str(r.codigo_sugerido)
+} for r in selected.itertuples()])
+users_edited=st.data_editor(users_table,hide_index=True,use_container_width=True,num_rows='fixed',
+    disabled=['referencia','fila_excel'], key='quality_reporters_'+hashlib.sha256(blob+plant_code.encode()).hexdigest()[:12],
+    column_config={'user_code':st.column_config.TextColumn('Código Fracttal (editable)'),
+                   'reportado_por':st.column_config.TextColumn('Reportado por (Excel; editable)'),
+                   'fila_excel':st.column_config.NumberColumn('Fila Excel'),
+                   'referencia':st.column_config.TextColumn('Referencia')})
+reporters={}
+for _,r in users_edited.iterrows():
+    name=str(r['reportado_por']).strip()
+    code=str(r['user_code']).strip().upper()
+    if code.lower() in ('nan','none'): code=''
+    if name.lower() in ('nan','none'):name=''
+    # Cuando se introduce nombre nuevo pero falta código, calcular automáticamente.
+    if name and not code: code=codigo_por_iniciales(name)
+    reporters[str(r['referencia'])]=(code if name else user_code.strip(),name if name else requested_by.strip())
+invalid_reporters=[ref for ref,(code,name) in reporters.items() if not re.fullmatch(r'[A-Z0-9_-]{1,40}',code)]
+if invalid_reporters:
+    st.error('Hay incidencias con código de solicitante vacío o inválido. Corrige la tabla: '+', '.join(invalid_reporters[:4]));st.stop()
+if any(str(r.reportado_por).strip() for r in selected.itertuples()):
+    st.info('Los códigos derivados de las iniciales son propuestas. Fracttal debe tener esos códigos dados de alta como usuarios con cuenta. Se interrumpirá el lote si rechaza alguno.')
+
+st.subheader('5 · Comprobar duplicados (solo lectura)')
+filetag=hashlib.sha256(blob+plant_code.encode()).hexdigest()[:12]
+if st.button('🔎 Consultar solicitudes existentes en Fracttal'):
+    try:
+        tk=oauth();refs,seen,items=fetch_all(tk,with_items=True)
+        st.session_state['audit_check']={'tag':filetag,'refs':refs,'total':seen,'items':items,'time':datetime.now().isoformat()}
+        st.success(f'Consulta completada: {seen} solicitudes examinadas.')
+    except Exception as e:
+        st.session_state.pop('audit_check',None);st.error(str(e))
+check=st.session_state.get('audit_check')
+if not check or check.get('tag')!=filetag:
+    st.warning('Primero debes consultar Fracttal. La importación permanece bloqueada.');st.stop()
+existing=check['refs'];new=selected[~selected.referencia.isin(existing)]
+duplicates=selected[selected.referencia.isin(existing)]
+x,y=st.columns(2);x.metric('Pendientes de crear',len(new));y.metric('Ya existentes / omitidas',len(duplicates))
+if not duplicates.empty:
+    with st.expander('Ver solicitudes ya registradas'):
+        st.dataframe(duplicates[['referencia','zona','incidencia']],hide_index=True)
+st.subheader('5B · Adjuntar fotos a solicitudes ya existentes')
+st.caption('Sirve también para recuperar las dos solicitudes de prueba: NO vuelve a crearlas.')
+items=check.get('items',[])
+by_ref={}
+for item in items:
+    ref=request_reference(item)
+    if ref and ref not in by_ref:
+        by_ref[ref]=item
+recoverable=[]
+for row in duplicates.itertuples():
+    photos=photo_map.get(row.referencia,[])
+    item=by_ref.get(row.referencia)
+    if photos and item:
+        recoverable.append({'referencia':row.referencia,'id_code':item.get('id_code'),
+                            'fotografias':len(photos),'archivos':photos})
+if recoverable:
+    st.info(f'{len(recoverable)} solicitudes existentes con fotografías asignadas; '
+            f'{sum(r["fotografias"] for r in recoverable)} fotografías en total.')
+    recovery_table=pd.DataFrame([{
+        'Procesar':False,'Referencia':r['referencia'],
+        'Solicitud Fracttal':str(r['id_code']), 'Fotografías':r['fotografias'],
+        'Archivos':', '.join(os.path.basename(f) for f in r['archivos'])
+    } for r in recoverable])
+    recovery_scope=hashlib.sha256((editor_key + '|' + '|'.join(
+        f"{r['referencia']}:{r['id_code']}:{','.join(r['archivos'])}" for r in recoverable
+    )).encode()).hexdigest()[:16]
+    recovery_all=st.checkbox('Seleccionar todas las solicitudes existentes con fotos',
+                             value=False,key='batch_all_'+recovery_scope)
+    if recovery_all: recovery_table['Procesar']=True
+    recovery_edited=st.data_editor(recovery_table,hide_index=True,use_container_width=True,
+        key='batch_editor_'+recovery_scope+'_'+str(recovery_all),num_rows='fixed',
+        disabled=['Referencia','Solicitud Fracttal','Fotografías','Archivos'])
+    to_recover=[r for r,flag in zip(recoverable,recovery_edited['Procesar']) if flag]
+    st.caption(f'Lote seleccionado: {len(to_recover)} solicitudes / '
+               f'{sum(r["fotografias"] for r in to_recover)} fotografías.')
+    st.warning('La API utilizada no permite confirmar aquí si un archivo idéntico ya '
+               'estaba adjunto. Antes de ejecutar, comprueba en Fracttal que las fotos '
+               'seleccionadas no estén cargadas. Si hay un error, NO reintentes '
+               'sin comprobar el estado remoto.')
+    recovery_confirm=st.checkbox('He comprobado en Fracttal que las fotografías del lote '
+        'seleccionado todavía NO están adjuntas',key='confirm_batch_recovery_'+recovery_scope)
+    recovery_phrase=st.text_input('Para autorizar el lote, escribe ADJUNTAR FOTOS',
+                                  key='phrase_batch_recovery_'+recovery_scope)
+    ready=bool(to_recover) and recovery_confirm and recovery_phrase.strip()=='ADJUNTAR FOTOS'
+    if st.button('📎 Adjuntar fotos a las solicitudes existentes seleccionadas',
+                 type='primary',disabled=not ready):
+        report=[]
+        try:
+            tk=oauth()
+            # Lectura reciente, completa, para no usar identificadores de una sesión antigua.
+            _,_,fresh_items=fetch_all(tk,with_items=True)
+            fresh_by_ref={}
+            for item in fresh_items:
+                ref=request_reference(item)
+                if ref: fresh_by_ref.setdefault(ref,[]).append(item)
+            # Validar el lote entero ANTES de comenzar la primera subida.
+            for rec in to_recover:
+                found=[i for i in fresh_by_ref.get(rec['referencia'],[])
+                       if str(i.get('id_code'))==str(rec['id_code'])]
+                if len(found)!=1 or len(fresh_by_ref.get(rec['referencia'],[]))!=1:
+                    raise RuntimeError('Referencia no única o identificador cambiado: '
+                                       +rec['referencia']+'. No se ha iniciado ninguna subida.')
+                for filepath in rec['archivos']:
+                    if filepath not in images:
+                        raise RuntimeError('Falta un archivo asignado: '+filepath)
+            bar=st.progress(0)
+            for index,rec in enumerate(to_recover,1):
+                try:
+                    n=attach_photos(tk,int(rec['id_code']),rec['archivos'],images)
+                    report.append({'Referencia':rec['referencia'],
+                                   'Solicitud Fracttal':rec['id_code'],
+                                   'Previstas':len(rec['archivos']),'Confirmadas':n,
+                                   'Estado':'Confirmado','Detalle':''})
+                except Exception as exc:
+                    report.append({'Referencia':rec['referencia'],
+                                   'Solicitud Fracttal':rec['id_code'],
+                                   'Previstas':len(rec['archivos']),'Confirmadas':'Sin verificar',
+                                   'Estado':'Revisión manual obligatoria',
+                                   'Detalle':str(exc)[:500]})
+                    st.error('El lote se ha detenido en '+rec['referencia']+
+                             '. Comprueba los adjuntos en Fracttal antes de reintentar.')
+                    break
+                bar.progress(index/len(to_recover))
+            if report:
+                result_df=pd.DataFrame(report)
+                st.dataframe(result_df,hide_index=True,use_container_width=True)
+                st.download_button('Descargar informe de adjuntos (CSV)',
+                    data=result_df.to_csv(index=False).encode('utf-8-sig'),
+                    file_name='resultado_adjuntos_solicitudes_existentes.csv',mime='text/csv')
+                if all(r['Estado']=='Confirmado' for r in report) and len(report)==len(to_recover):
+                    st.success(f'Finalizado: {len(report)} solicitudes y '
+                               f'{sum(r["Confirmadas"] for r in report)} fotografías confirmadas.')
+        except Exception as exc:
+            st.error('No se pudo iniciar el lote de adjuntos: '+str(exc))
+else:
+    st.info('No hay solicitudes ya existentes con fotografías vinculadas en esta carga. '
+            'Selecciona una incidencia creada y asígnale sus fotos en el apartado 3B.')
+
+if new.empty:
+    st.success('No hay nuevas solicitudes que crear. Puedes recuperar sus fotografías en el apartado 5B.');st.stop()
+with st.expander('Diagnóstico de la petición POST (sin datos personales ni texto del hallazgo)'):
+    g,c1,c2=class_by_ref[str(new.iloc[0]['referencia'])]
+    sample=body_of(new.iloc[0],*reporters[str(new.iloc[0]['referencia'])],urgency.startswith('Urgente'),plant_name,asset_code,g,c1,c2)
+    st.write('Endpoint: POST /work_requests/')
+    st.write('Campos enviados:', ', '.join(sorted(sample.keys())))
+    st.write('user_code (de esta incidencia):', sample['user_code'])
+    st.write('user_type:', sample['user_type'])
+    st.write('code (activo):', sample['code'])
+    st.write('Grupo:', sample['types_description'])
+    st.write('Clasificación 1:', sample['types_1_description'])
+    st.write('Clasificación 2:', sample['types_2_description'])
+    st.caption('No se muestran observaciones, descripción ni credenciales. El código 404 de Fracttal no demuestra por sí solo qué campo es inválido.')
+with st.expander('Vista previa: datos que se enviarán a Fracttal'):
+    preview=new[['referencia','fecha','numero_registro','zona','incidencia','accion_calidad']].copy()
+    preview[['Grupo','C1','C2']]=preview['referencia'].apply(lambda ref:pd.Series(class_by_ref[ref]))
+    preview['Reportado por']=preview['referencia'].map(lambda ref:reporters[ref][1])
+    preview['Código usuario']=preview['referencia'].map(lambda ref:reporters[ref][0])
+    preview['Fotografías previstas']=preview['referencia'].map(lambda ref:len(photo_map.get(ref,[])))
+    st.dataframe(preview,hide_index=True,use_container_width=True)
+
+st.subheader('6 · Crear solicitudes')
+st.warning('Esta acción CREA solicitudes REALES. Se comprueban duplicados antes del envío y se detiene el lote ante el primer error. Revisa las fotos y clasificaciones.')
+run_mode=st.radio('Alcance de la importación',['Una sola solicitud de prueba','Todas las seleccionadas que falten'],horizontal=False)
+if run_mode=='Una sola solicitud de prueba':
+    opts=[f"Fila {int(r.fila_excel)} · {str(r.zona)[:35]} · {str(r.incidencia)[:85]}" for r in new.itertuples()]
+    chosen=st.selectbox('Incidencia de prueba',opts)
+    target=new.iloc[[opts.index(chosen)]]
+else:
+    if len(new)>25:
+        st.error('Por seguridad, importa como máximo 25 solicitudes por lote. Reduce las fechas o la selección.');st.stop()
+    target=new
+missing_photos=[r['referencia'] for _,r in target.iterrows() if not photo_map.get(r['referencia'])]
+if missing_photos:
+    st.warning(f'Hay {len(missing_photos)} incidencia(s) sin fotografía. Puedes crearlas ahora y adjuntar las fotografías después desde 5B, sin duplicarlas.')
+    accept_pending=st.checkbox('Autorizo crear también las solicitudes sin fotografía y adjuntarlas posteriormente',key='quality_accept_without_photos')
+else:
+    accept_pending=True
+confirmed=st.checkbox('He comprobado las incidencias y autorizo crear solicitudes reales en Fracttal')
+confirmation=st.text_input('Escribe CREAR SOLICITUDES para confirmar',value='')
+allowed=confirmed and accept_pending and confirmation.strip()=='CREAR SOLICITUDES'
+if st.button('🚀 Crear solicitudes seleccionadas',type='primary',disabled=not allowed):
+    results=[]
+    try:
+        tk=oauth()
+        current_refs,_=fetch_all(tk) # vuelve a consultar justo antes de escribir
+        bar=st.progress(0)
+        for i,(_,row) in enumerate(target.iterrows()):
+            ref=str(row['referencia'])
+            if ref in current_refs:
+                results.append({'referencia':ref,'resultado':'Omitida: ya existe','detalle':''})
+            else:
+                try:
+                    response=request('POST','/work_requests/',tk,payload=body_of(row,*reporters[ref],urgency.startswith('Urgente'),plant_name,asset_code,*class_by_ref[ref]))
+                    confirmed_remote=bool(isinstance(response,dict) and response.get('success') is True and response.get('data'))
+                    if not confirmed_remote:
+                        results.append({'referencia':ref,'resultado':'Respuesta sin confirmación','detalle':'Comprobar en Fracttal'})
+                        st.error('Respuesta de creación sin confirmación. Verifica Fracttal antes de continuar.');break
+                    current_refs.add(ref)
+                    photos=photo_map.get(ref,[])
+                    if photos:
+                        req_id=response_id(response)
+                        if req_id is None:
+                            results.append({'referencia':ref,'resultado':'Solicitud creada; fotos pendientes','detalle':'La respuesta no incluye id/id_code. Revisar en Fracttal antes de reintentar.'})
+                            st.error('Solicitud creada, pero falta identificador para adjuntar fotos. Se detiene el proceso.');break
+                        try:
+                            n=attach_photos(tk,req_id,photos,images)
+                            results.append({'referencia':ref,'resultado':f'Creada con {n} foto(s)','detalle':''})
+                        except Exception as attach_error:
+                            results.append({'referencia':ref,'resultado':'Solicitud creada; adjuntos pendientes','detalle':str(attach_error)[:180]})
+                            st.error('Solicitud creada, pero falló la asociación de fotografías. No vuelvas a crearla: revisa Fracttal y el informe.');break
+                    else:
+                        results.append({'referencia':ref,'resultado':'Creada; fotografías pendientes','detalle':'Adjuntar posteriormente desde 5B con el mismo Excel y una foto asignada a esta referencia.'})
+                except Exception as e:
+                    results.append({'referencia':ref,'resultado':'Error / comprobar en Fracttal','detalle':str(e)[:1200]})
+                    st.error('Fracttal ha rechazado la petición o no se ha podido confirmar. Lee la columna detalle para conocer la validación y comprueba la solicitud antes de reintentar.');break
+            bar.progress((i+1)/len(target))
+        if results:
+            out=pd.DataFrame(results)
+            st.dataframe(out,hide_index=True,use_container_width=True)
+            st.download_button('Descargar resultado CSV',data=out.to_csv(index=False).encode('utf-8-sig'),file_name='resultado_importacion_auditorias.csv',mime='text/csv')
+            st.session_state.pop('audit_check',None)
+    except Exception as e:st.error(str(e))
+
+st.caption('Versión 2.8 · Solicitante por incidencia desde Excel · Fotografías opcionales durante la creación y recuperación múltiple en 5B · Filtro de fechas y Grupo/C1/C2 individual.')
+st.caption('Puedes crear sin fotos y asociarlas después desde 5B. Si falla un adjunto, la solicitud ya creada NO se repite. Fuente: Excel del Departamento de Calidad. API oficial: https://api.fracttal.com/es/reference/crear-una-nueva-solicitud')
