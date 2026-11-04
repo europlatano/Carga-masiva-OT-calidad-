@@ -86,13 +86,15 @@ def registro_normalizado(value):
 
 def columna_numero_registro(frame):
     aliases={'numero de registro','n registro','nº registro','num registro',
-             'numero registro','registro','nro registro','no registro'}
+             'numero registro','registro','nro registro','no registro',
+             'numero de incidencia','numero incidencia','n incidencia','num incidencia',
+             'nro incidencia','no incidencia','incidencia numero','incidencia n'}
     for col in frame.columns:
         label=norm(col).replace('_',' ').replace('.',' ').strip()
         label=re.sub(r'\s+',' ',label)
         label=label.replace('n°','n').replace('nº','n')
         if label in aliases: return col
-    raise ValueError('No se encuentra la columna «Número de registro» en el Excel. Comprueba su encabezado.')
+    raise ValueError('No se encuentra la columna «Número de incidencia» (o «Número de registro») en el Excel. Comprueba su encabezado.')
 
 def numeros_de_foto(path):
     """Busca números completos en el nombre, sin usar números de carpeta."""
@@ -363,7 +365,7 @@ def match_photos(images, df):
         matched={ref for n in numbers for ref in by_number.get(n,set())}
         if len(matched)==1:
             ref=next(iter(matched))
-            rows.append({'fotografia':path,'referencia':ref,'coincidencia':'Número de registro exacto'})
+            rows.append({'fotografia':path,'referencia':ref,'coincidencia':'Número de incidencia exacto'})
         else:
             rows.append({'fotografia':path,'referencia':'(Sin asignar)',
                          'coincidencia':'Registro ambiguo' if matched else 'Registro no encontrado'})
@@ -667,7 +669,7 @@ try:
             name=f'Galeria/{i:03d}_{os.path.basename(f.name)}'
             images[name]=content
     if images:
-        st.caption(f'{len(images)} fotografías examinadas. La asociación se realiza únicamente por el número de registro del Excel.')
+        st.caption(f'{len(images)} fotografías examinadas. La asociación se realiza únicamente por el número de incidencia del Excel.')
         mapping=match_photos(images,selected)
         mapping=mapping[mapping['referencia']!='(Sin asignar)'].reset_index(drop=True)
         options=['(Sin asignar)']+selected['referencia'].tolist()
@@ -679,8 +681,8 @@ try:
         for r in mapping.itertuples():
             if r.referencia!='(Sin asignar)': photo_map.setdefault(r.referencia,[]).append(r.fotografia)
         linked=sum(len(v) for v in photo_map.values())
-        st.info(f'Fotografías de mantenimiento asociadas por número de registro: {linked}. Fotografías descartadas: {len(images)-linked}.')
-        summary=pd.DataFrame([{'Incidencia de mantenimiento':str(rec.incidencia),'Número de registro':str(rec.numero_registro),'Referencia':str(rec.referencia),'Fotos asociadas':len(photo_map.get(str(rec.referencia),[])),'Archivos':', '.join(os.path.basename(x) for x in photo_map.get(str(rec.referencia),[]))} for rec in selected.itertuples()])
+        st.info(f'Fotografías de mantenimiento asociadas por número de incidencia: {linked}. Fotografías descartadas: {len(images)-linked}.')
+        summary=pd.DataFrame([{'Incidencia de mantenimiento':str(rec.incidencia),'Número de incidencia':str(rec.numero_registro),'Referencia':str(rec.referencia),'Fotos asociadas':len(photo_map.get(str(rec.referencia),[])),'Archivos':', '.join(os.path.basename(x) for x in photo_map.get(str(rec.referencia),[]))} for rec in selected.itertuples()])
         st.subheader('Resumen de fotografías de mantenimiento')
         st.dataframe(summary,hide_index=True,use_container_width=True)
         with st.expander('Vista previa de fotografías asociadas',expanded=bool(gallery_files)):
